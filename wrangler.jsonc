@@ -5,6 +5,13 @@
   "triggers": {
     "crons": ["*/1 * * * *"]
   },
+  "d1_databases": [
+    {
+      "binding": "MEMBERS_DB",
+      "database_name": "wos-gift-members",
+      "database_id": "3ca58bf3-2c36-4006-bcf8-9552227eb10c"
+    }
+  ],
   "secrets": {
     "required": ["DISCORD_BOT_TOKEN"]
   }
