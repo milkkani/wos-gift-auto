@@ -4,5 +4,8 @@
   "compatibility_date": "2026-08-26",
   "triggers": {
     "crons": ["*/1 * * * *"]
+  },
+  "secrets": {
+    "required": ["DISCORD_BOT_TOKEN"]
   }
 }
