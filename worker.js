@@ -1,22 +1,137 @@
 const SOURCE_CHANNEL = "1542165450207527094";
 const RESULT_CHANNEL = "1542167671154409563";
-const PLAYER_ID = "441788306";
-const KINGDOM_ID = "3338";
 const WOS_API = "https://wos-giftcode-api.centurygame.com/api/gift_code";
 const WOS_KEY = "tB87#kPtkxqOS2";
 
 export default {
-  async fetch() {
-    return Response.json({
-      ok: true,
-      message: "ホワサバ自動ギフトコードBotは待機中です",
-    });
+  async fetch(request, env) {
+    await ensureDatabase(env);
+    const url = new URL(request.url);
+
+    if (request.method === "POST" && url.pathname === "/register") {
+      return registerMember(request, env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/") {
+      return new Response(REGISTRATION_PAGE, {
+        headers: { "Content-Type": "text/html; charset=UTF-8" },
+      });
+    }
+
+    return new Response("Not Found", { status: 404 });
   },
 
   async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(checkDiscord(env));
+    ctx.waitUntil(runScheduled(env));
   },
 };
+
+async function runScheduled(env) {
+  await ensureDatabase(env);
+  await checkDiscord(env);
+}
+
+async function ensureDatabase(env) {
+  if (!env.MEMBERS_DB) {
+    throw new Error("MEMBERS_DB が未設定です");
+  }
+
+  await env.MEMBERS_DB.batch([
+    env.MEMBERS_DB.prepare(`
+      CREATE TABLE IF NOT EXISTS members (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_name TEXT NOT NULL,
+        player_id TEXT NOT NULL,
+        kingdom_id TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(player_id, kingdom_id)
+      )
+    `),
+    env.MEMBERS_DB.prepare(`
+      CREATE TABLE IF NOT EXISTS processed_codes (
+        code TEXT NOT NULL,
+        member_id INTEGER NOT NULL,
+        err_code TEXT NOT NULL,
+        message TEXT,
+        processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(code, member_id)
+      )
+    `),
+  ]);
+
+  await env.MEMBERS_DB.prepare(`
+    INSERT OR IGNORE INTO members
+    (player_name, player_id, kingdom_id)
+    VALUES (?, ?, ?)
+  `).bind("シュガー", "441788306", "3338").run();
+}
+
+async function registerMember(request, env) {
+  const form = await request.formData();
+  const playerName = String(form.get("player_name") || "").trim();
+  const playerId = String(form.get("player_id") || "").trim();
+  const kingdomId = String(form.get("kingdom_id") || "").trim();
+
+  if (playerName.length < 1 || playerName.length > 30) {
+    return pageMessage(
+      "登録できません",
+      "名前は1〜30文字で入力してください。",
+      false,
+    );
+  }
+
+  if (!/^\d{6,15}$/.test(playerId)) {
+    return pageMessage(
+      "登録できません",
+      "プレイヤーIDは6〜15桁の数字で入力してください。",
+      false,
+    );
+  }
+
+  if (!/^\d{1,6}$/.test(kingdomId) || Number(kingdomId) < 1) {
+    return pageMessage(
+      "登録できません",
+      "王国番号を数字で入力してください。",
+      false,
+    );
+  }
+
+  const count = await env.MEMBERS_DB.prepare(
+    "SELECT COUNT(*) AS total FROM members WHERE active = 1",
+  ).first();
+
+  if (Number(count?.total || 0) >= 500) {
+    return pageMessage(
+      "登録できません",
+      "登録上限に達しています。管理者へ連絡してください。",
+      false,
+    );
+  }
+
+  try {
+    await env.MEMBERS_DB.prepare(`
+      INSERT INTO members
+      (player_name, player_id, kingdom_id)
+      VALUES (?, ?, ?)
+    `).bind(playerName, playerId, kingdomId).run();
+  } catch (error) {
+    if (String(error).includes("UNIQUE")) {
+      return pageMessage(
+        "登録済みです",
+        "このプレイヤーIDと王国番号はすでに登録されています。",
+        true,
+      );
+    }
+    throw error;
+  }
+
+  return pageMessage(
+    "登録完了！",
+    `${escapeHtml(playerName)}さんを王国${escapeHtml(kingdomId)}で登録しました。次回から新しいギフトコードを自動受取します。`,
+    true,
+  );
+}
 
 async function checkDiscord(env) {
   if (!env.DISCORD_BOT_TOKEN) {
@@ -28,7 +143,8 @@ async function checkDiscord(env) {
     {
       headers: {
         Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
-        "User-Agent": "WOSGiftAuto (https://workers.cloudflare.com, 1.0)",
+        "User-Agent":
+          "WOSGiftAuto (https://workers.cloudflare.com, 2.0)",
       },
     },
   );
@@ -60,65 +176,84 @@ async function checkDiscord(env) {
   }
 
   for (const code of codes) {
-    await processCode(code, env);
+    await processCodeForMembers(code, env);
   }
 }
 
-async function processCode(code, env) {
-  const cache = caches.default;
-  const cacheKey = new Request(
-    `https://wos-gift-auto.invalid/processed/${encodeURIComponent(code)}`,
-  );
+async function processCodeForMembers(code, env) {
+  const { results: members = [] } =
+    await env.MEMBERS_DB.prepare(`
+      SELECT
+        m.id,
+        m.player_name,
+        m.player_id,
+        m.kingdom_id
+      FROM members m
+      LEFT JOIN processed_codes p
+        ON p.member_id = m.id
+        AND p.code = ?
+      WHERE m.active = 1
+        AND p.member_id IS NULL
+      ORDER BY m.id
+      LIMIT 500
+    `).bind(code).all();
 
-  if (await cache.match(cacheKey)) return;
+  if (members.length === 0) return;
 
-  const result = await redeem(code);
+  let success = 0;
+  let already = 0;
+  let failed = 0;
 
-  const terminalCodes = new Set([
-    "20000",
-    "40005",
-    "40006",
-    "40007",
-    "40008",
-    "40010",
-    "40011",
-    "40014",
-    "40020",
-  ]);
-
-  if (terminalCodes.has(result.errCode)) {
-    await cache.put(
-      cacheKey,
-      new Response("processed", {
-        headers: {
-          "Cache-Control": "public, max-age=2592000",
-        },
-      }),
+  for (const member of members) {
+    const result = await redeem(
+      code,
+      member.player_id,
+      member.kingdom_id,
     );
+
+    await env.MEMBERS_DB.prepare(`
+      INSERT OR REPLACE INTO processed_codes
+      (code, member_id, err_code, message)
+      VALUES (?, ?, ?, ?)
+    `).bind(
+      code,
+      member.id,
+      result.errCode,
+      result.message,
+    ).run();
+
+    if (result.errCode === "20000") {
+      success++;
+    } else if (
+      ["40005", "40008", "40011"].includes(result.errCode)
+    ) {
+      already++;
+    } else {
+      failed++;
+    }
   }
 
-  if (result.errCode === "20000") {
-    await sendDiscord(
-      env,
-      `✅ **ギフトコードを自動受取しました**
+  await sendDiscord(
+    env,
+    `🎁 **ギフトコード自動交換結果**
 コード：\`${code}\`
-プレイヤーID：\`${PLAYER_ID}\`
-報酬はゲーム内メールを確認してください。`,
-    );
-  }
+✅ 受取成功：${success}人
+☑️ 受取済み：${already}人
+⚠️ その他：${failed}人`,
+  );
 }
 
-async function redeem(code) {
+async function redeem(code, playerId, kingdomId) {
   const time = Math.floor(Date.now() / 1000).toString();
 
   const sign = md5(
-    `cdk=${code}&fid=${PLAYER_ID}&kid=${KINGDOM_ID}&time=${time}${WOS_KEY}`,
+    `cdk=${code}&fid=${playerId}&kid=${kingdomId}&time=${time}${WOS_KEY}`,
   );
 
   const body = new URLSearchParams({
     cdk: code,
-    fid: PLAYER_ID,
-    kid: KINGDOM_ID,
+    fid: playerId,
+    kid: kingdomId,
     time,
     sign,
   });
@@ -128,22 +263,21 @@ async function redeem(code) {
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json, text/plain, */*",
-      "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
       Origin: "https://wos-giftcode.centurygame.com",
       Referer: "https://wos-giftcode.centurygame.com/",
       "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/134.0.0.0 Safari/537.36",
+        "Mozilla/5.0 AppleWebKit/537.36 Chrome/134 Safari/537.36",
     },
     body: body.toString(),
   });
 
-  const text = await response.text();
-
   if (!response.ok) {
-    throw new Error(`ホワサバAPIエラー: HTTP ${response.status}`);
+    throw new Error(
+      `ホワサバAPIエラー: HTTP ${response.status}`,
+    );
   }
 
-  const data = JSON.parse(text);
+  const data = await response.json();
 
   return {
     errCode: String(data.err_code ?? ""),
@@ -159,31 +293,240 @@ async function sendDiscord(env, content) {
       headers: {
         Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
         "Content-Type": "application/json",
-        "User-Agent": "WOSGiftAuto (https://workers.cloudflare.com, 1.0)",
       },
       body: JSON.stringify({ content }),
     },
   );
 
   if (!response.ok) {
-    throw new Error(`Discord送信エラー: HTTP ${response.status}`);
+    throw new Error(
+      `Discord送信エラー: HTTP ${response.status}`,
+    );
   }
 }
+
+function pageMessage(title, message, ok) {
+  return new Response(
+    `<!doctype html>
+<html lang="ja">
+<meta
+  name="viewport"
+  content="width=device-width,initial-scale=1"
+>
+<style>${PAGE_STYLE}</style>
+<body>
+  <main>
+    <div class="mark">${ok ? "✓" : "!"}</div>
+    <h1>${title}</h1>
+    <p>${message}</p>
+    <a href="/">登録画面へ戻る</a>
+  </main>
+</body>
+</html>`,
+    {
+      status: ok ? 200 : 400,
+      headers: {
+        "Content-Type": "text/html; charset=UTF-8",
+      },
+    },
+  );
+}
+
+function escapeHtml(value) {
+  return value.replace(
+    /[&<>"']/g,
+    (char) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      })[char],
+  );
+}
+
+const PAGE_STYLE = `
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #071426;
+  color: #f7fbff;
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 22px;
+}
+
+main {
+  width: min(100%, 440px);
+  background:
+    linear-gradient(145deg, #102746, #0b1c33);
+  border: 1px solid #27466e;
+  border-radius: 26px;
+  padding: 30px;
+  box-shadow: 0 24px 70px #0008;
+}
+
+h1 {
+  margin: 8px 0 12px;
+  font-size: 28px;
+}
+
+p {
+  color: #b9c9dc;
+  line-height: 1.7;
+}
+
+.logo,
+.mark {
+  width: 58px;
+  height: 58px;
+  display: grid;
+  place-items: center;
+  border-radius: 18px;
+  background: #ffb229;
+  color: #111;
+  font-size: 30px;
+  font-weight: 800;
+}
+
+label {
+  display: block;
+  margin: 18px 0 7px;
+  color: #d9e6f4;
+  font-weight: 700;
+}
+
+input {
+  width: 100%;
+  border: 1px solid #36567d;
+  background: #07172b;
+  color: white;
+  border-radius: 13px;
+  padding: 15px;
+  font-size: 17px;
+  outline: none;
+}
+
+input:focus {
+  border-color: #ffb229;
+  box-shadow: 0 0 0 3px #ffb22922;
+}
+
+button,
+a {
+  display: block;
+  width: 100%;
+  margin-top: 24px;
+  border: 0;
+  border-radius: 14px;
+  padding: 16px;
+  background: #ffb229;
+  color: #15100a;
+  text-align: center;
+  text-decoration: none;
+  font-size: 17px;
+  font-weight: 800;
+}
+
+.note {
+  font-size: 13px;
+  color: #849ab3;
+  margin-top: 16px;
+}
+`;
+
+const REGISTRATION_PAGE = `
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+  >
+  <title>ホワサバ ギフトコード自動受取</title>
+  <style>${PAGE_STYLE}</style>
+</head>
+<body>
+  <main>
+    <div class="logo">🎁</div>
+    <h1>ギフトコード自動受取</h1>
+    <p>
+      一度登録すると、新しいギフトコードを検知した際に
+      自動で交換します。
+    </p>
+
+    <form method="post" action="/register">
+      <label>ゲーム内の名前</label>
+      <input
+        name="player_name"
+        maxlength="30"
+        required
+        placeholder="例：シュガー"
+      >
+
+      <label>プレイヤーID</label>
+      <input
+        name="player_id"
+        inputmode="numeric"
+        pattern="[0-9]*"
+        required
+        placeholder="例：441788306"
+      >
+
+      <label>王国番号</label>
+      <input
+        name="kingdom_id"
+        inputmode="numeric"
+        pattern="[0-9]*"
+        required
+        placeholder="例：3338"
+      >
+
+      <button type="submit">
+        自動受取に登録する
+      </button>
+    </form>
+
+    <div class="note">
+      ゲームのログイン情報は不要です。
+      同じIDと王国番号は重複登録されません。
+    </div>
+  </main>
+</body>
+</html>
+`;
 
 function md5(input) {
   const add = (a, b) => (a + b) & 0xffffffff;
 
   const cmn = (q, a, b, x, s, t) => {
     const n = add(add(a, q), add(x, t));
-    return add((n << s) | (n >>> (32 - s)), b);
+    return add(
+      (n << s) | (n >>> (32 - s)),
+      b,
+    );
   };
 
   const ff = (a,b,c,d,x,s,t) =>
     cmn((b&c)|(~b&d),a,b,x,s,t);
+
   const gg = (a,b,c,d,x,s,t) =>
     cmn((b&d)|(c&~d),a,b,x,s,t);
+
   const hh = (a,b,c,d,x,s,t) =>
     cmn(b^c^d,a,b,x,s,t);
+
   const ii = (a,b,c,d,x,s,t) =>
     cmn(c^(b|~d),a,b,x,s,t);
 
@@ -199,13 +542,16 @@ function md5(input) {
   x[len >> 2] |= 0x80 << ((len % 4) * 8);
   x[total - 2] = len * 8;
 
-  let A=1732584193;
-  let B=-271733879;
-  let C=-1732584194;
-  let D=271733878;
+  let A = 1732584193;
+  let B = -271733879;
+  let C = -1732584194;
+  let D = 271733878;
 
-  for(let j=0;j<x.length;j+=16) {
-    let a=A,b=B,c=C,d=D;
+  for (let j = 0; j < x.length; j += 16) {
+    let a = A;
+    let b = B;
+    let c = C;
+    let d = D;
 
     a=ff(a,b,c,d,x[j],7,-680876936);
     d=ff(d,a,b,c,x[j+1],12,-389564586);
@@ -275,17 +621,19 @@ function md5(input) {
     c=ii(c,d,a,b,x[j+2],15,718787259);
     b=ii(b,c,d,a,x[j+9],21,-343485551);
 
-    A=add(A,a);
-    B=add(B,b);
-    C=add(C,c);
-    D=add(D,d);
+    A = add(A, a);
+    B = add(B, b);
+    C = add(C, c);
+    D = add(D, d);
   }
 
-  return [A,B,C,D]
+  return [A, B, C, D]
     .map((n) =>
-      [0,8,16,24]
+      [0, 8, 16, 24]
         .map((s) =>
-          ((n>>>s)&255).toString(16).padStart(2,"0"),
+          ((n >>> s) & 255)
+            .toString(16)
+            .padStart(2, "0"),
         )
         .join(""),
     )
