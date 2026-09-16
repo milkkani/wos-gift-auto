@@ -13,7 +13,7 @@ const WOS_KEY = "tB87#kPtkxqOS2";
  * 一度に全員を無理に処理せず、
  * 残った人は次の毎分Cronで処理する。
  */
-const MAX_MEMBERS_PER_RUN = 20;
+const MAX_MEMBERS_PER_RUN = 10;
 
 /*
  * 1人あたりの通信タイムアウト
@@ -118,6 +118,13 @@ async function ensureDatabase(env) {
         message TEXT,
         processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY(code, member_id)
+      )
+    `),    env.MEMBERS_DB.prepare(`
+      CREATE TABLE IF NOT EXISTS code_jobs (
+        code TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        notified INTEGER NOT NULL DEFAULT 0,
+        locked_until INTEGER NOT NULL DEFAULT 0
       )
     `),
   ]);
@@ -347,22 +354,71 @@ async function checkDiscord(env) {
   /*
    * コードを順番に処理
    */
-  for (const code of codes) {
 
+    /*
+   * Discordで見つけたコードをD1へ保存。
+   * ここでは交換処理はまだ行わない。
+   */
+
+  for (const code of codes) {
+  await env.MEMBERS_DB.prepare(`
+    INSERT OR IGNORE INTO code_jobs (
+      code,
+      notified
+    )
+    VALUES (
+      ?,
+      CASE
+        WHEN EXISTS (
+          SELECT 1
+          FROM processed_codes
+          WHERE code = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM members m
+          LEFT JOIN processed_codes p
+            ON p.member_id = m.id
+            AND p.code = ?
+          WHERE m.active = 1
+            AND p.member_id IS NULL
+        )
+        THEN 1
+        ELSE 0
+      END
+    )
+  `)
+    .bind(
+      code,
+      code,
+      code,
+    )
+    .run();
+}
+
+  /*
+   * D1に残っている未完了コードを処理する。
+   * Discordの直近20件から消えても処理を継続できる。
+   */
+  const { results: jobs = [] } =
+    await env.MEMBERS_DB.prepare(`
+      SELECT code
+      FROM code_jobs
+      WHERE notified = 0
+      ORDER BY created_at ASC
+      LIMIT 10
+    `)
+      .all();
+
+  for (const job of jobs) {
     try {
       await processCodeForMembers(
-        code,
+        job.code,
         env,
       );
-
     } catch (error) {
-
-      /*
-       * 1つのコードで問題が起きても
-       * 他のコードの処理は続ける
-       */
       console.error(
-        `code ${code} error:`,
+        `code ${job.code} error:`,
         error,
       );
     }
@@ -378,324 +434,307 @@ async function processCodeForMembers(
   code,
   env,
 ) {
+  const now = Math.floor(Date.now() / 1000);
+  const lockUntil = now + 180;
 
   /*
-   * まだこのコードを処理していない人だけ取得。
-   *
-   * 一度に最大20人。
-   * 残りは次のCronで自動的に取得される。
+   * このコードの処理権を取得。
+   * 別のCronが処理中なら触らない。
    */
-  const { results: members = [] } =
+  const lockResult =
     await env.MEMBERS_DB.prepare(`
-      SELECT
-        m.id,
-        m.player_name,
-        m.player_id,
-        m.kingdom_id
-
-      FROM members m
-
-      LEFT JOIN processed_codes p
-        ON p.member_id = m.id
-        AND p.code = ?
-
-      WHERE
-        m.active = 1
-        AND p.member_id IS NULL
-
-      ORDER BY m.id
-
-      LIMIT ?
+      UPDATE code_jobs
+      SET locked_until = ?
+      WHERE code = ?
+        AND notified = 0
+        AND locked_until < ?
     `)
       .bind(
+        lockUntil,
         code,
-        MAX_MEMBERS_PER_RUN,
+        now,
       )
-      .all();
+      .run();
 
+  const changed =
+    Number(
+      lockResult?.meta?.changes ??
+      lockResult?.changes ??
+      0,
+    );
 
-  if (members.length === 0) {
+  if (changed === 0) {
+    console.log(
+      `code ${code}: locked or already notified`,
+    );
     return;
   }
 
+  try {
+    /*
+     * まだ処理が完了していない人を
+     * 最大10人だけ取得。
+     */
+    const { results: members = [] } =
+      await env.MEMBERS_DB.prepare(`
+        SELECT
+          m.id,
+          m.player_name,
+          m.player_id,
+          m.kingdom_id
+        FROM members m
+        LEFT JOIN processed_codes p
+          ON p.member_id = m.id
+          AND p.code = ?
+        WHERE m.active = 1
+          AND p.member_id IS NULL
+        ORDER BY m.id
+        LIMIT ?
+      `)
+        .bind(
+          code,
+          MAX_MEMBERS_PER_RUN,
+        )
+        .all();
 
-  let success = 0;
-  let already = 0;
-  let failed = 0;
-  let retry = 0;
-
-
-  /*
-   * このエラーコードは
-   * 「処理終了」としてDBに保存する。
-   *
-   * 保存されなかったものは
-   * 次の毎分Cronで再試行される。
-   */
-  const finalCodes =
-    new Set([
+    /*
+     * DBへ保存する最終結果。
+     * ここに無い結果は一時的なものとして
+     * 次回Cronで再試行する。
+     */
+    const finalCodes = new Set([
       "20000",
-
       "40005",
       "40006",
       "40007",
-
       "40008",
-
       "40010",
       "40011",
-
       "40014",
       "40020",
     ]);
 
-
-  /*
-   * 1人ずつ処理
-   */
-  for (const member of members) {
-
-    let result;
-
-
-    /*
-     * ★重要
-     *
-     * 1人の通信失敗で
-     * 全員の処理が止まらないようにする。
-     */
-    try {
-
-      result = await redeem(
-        code,
-        member.player_id,
-        member.kingdom_id,
-      );
-
-    } catch (error) {
-
-      console.error(
-        `redeem error
-code=${code}
-name=${member.player_name}
-player=${member.player_id}`,
-
-        error,
-      );
-
-
-      /*
-       * DBへ保存しない。
-       *
-       * つまり次のCronで
-       * この人だけ再試行される。
-       */
-      retry++;
-
-      continue;
-    }
-
-
-    console.log(
-      "redeem result:",
-      {
-        code,
-        player:
+    for (const member of members) {
+      try {
+        const result = await redeem(
+          code,
           member.player_id,
-        errCode:
-          result.errCode,
-        message:
-          result.message,
-      },
-    );
+          member.kingdom_id,
+        );
 
+        console.log(
+          "redeem result:",
+          {
+            code,
+            player: member.player_id,
+            errCode: result.errCode,
+            message: result.message,
+          },
+        );
 
-    /*
-     * 一時的なエラー
-     */
-    if (
-      !finalCodes.has(
-        result.errCode,
-      )
-    ) {
+        /*
+         * 未知・一時的な結果は保存しない。
+         * 次回Cronで再試行。
+         */
+        if (
+          !finalCodes.has(
+            result.errCode,
+          )
+        ) {
+          console.log(
+            `retry later: code=${code} player=${member.player_id} err=${result.errCode}`,
+          );
+          continue;
+        }
 
-      retry++;
+        /*
+         * 最終結果だけ保存。
+         */
+        await env.MEMBERS_DB.prepare(`
+          INSERT OR REPLACE INTO processed_codes
+          (
+            code,
+            member_id,
+            err_code,
+            message
+          )
+          VALUES (?, ?, ?, ?)
+        `)
+          .bind(
+            code,
+            member.id,
+            result.errCode,
+            result.message,
+          )
+          .run();
 
-      continue;
+      } catch (error) {
+        /*
+         * 1人失敗しても残りの人は続ける。
+         * DBへ保存しないので次回再試行される。
+         */
+        console.error(
+          `redeem error: code=${code} name=${member.player_name} player=${member.player_id}`,
+          error,
+        );
+      }
     }
 
-
     /*
-     * 処理終了結果を保存
+     * 全登録者のうち、
+     * まだ最終結果が保存されていない人数。
      */
-    try {
-
-      await env.MEMBERS_DB.prepare(`
-        INSERT OR REPLACE
-        INTO processed_codes
-        (
-          code,
-          member_id,
-          err_code,
-          message
-        )
-        VALUES (?, ?, ?, ?)
-      `)
-        .bind(
-          code,
-          member.id,
-          result.errCode,
-          result.message,
-        )
-        .run();
-
-    } catch (error) {
-
-      /*
-       * DB保存失敗でも
-       * 他のプレイヤーは続行。
-       *
-       * 保存できなかった人は
-       * 次回また処理される。
-       */
-      console.error(
-        "processed_codes save error:",
-        error,
-      );
-
-      retry++;
-
-      continue;
-    }
-
-
-    /*
-     * 結果集計
-     */
-    if (
-      result.errCode === "20000"
-    ) {
-
-      success++;
-
-    } else if (
-      [
-        "40008",
-        "40011",
-      ].includes(
-        result.errCode,
-      )
-    ) {
-
-      already++;
-
-    } else {
-
-      failed++;
-    }
-  }
-
-
-  /*
-   * 全員が再試行待ちだった場合は
-   * Discordへ毎分同じ通知を出さない。
-   */
-  if (
-    success +
-      already +
-      failed ===
-    0
-  ) {
-    return;
-  }
-
-
-  /*
-   * このコードについて
-   * まだ未処理の人数を確認
-   */
-  let remaining = 0;
-
-  try {
-
-    const row =
+    const remainingRow =
       await env.MEMBERS_DB.prepare(`
         SELECT COUNT(*) AS total
-
         FROM members m
-
         LEFT JOIN processed_codes p
           ON p.member_id = m.id
           AND p.code = ?
-
-        WHERE
-          m.active = 1
+        WHERE m.active = 1
           AND p.member_id IS NULL
       `)
         .bind(code)
         .first();
 
-    remaining =
+    const remaining =
       Number(
-        row?.total || 0,
+        remainingRow?.total || 0,
       );
 
-  } catch (error) {
-
-    console.error(
-      "remaining count error:",
-      error,
+    console.log(
+      `code ${code}: remaining=${remaining}`,
     );
-  }
 
+    /*
+     * まだ残っていれば通知しない。
+     * 次の毎分Cronへ。
+     */
+    if (remaining > 0) {
+      return;
+    }
 
-  /*
-   * Discord通知
-   */
-  let content =
-    `🎁 **ギフトコード自動交換結果**
+    /*
+     * 全員完了。
+     * 今までの全結果をDBから集計する。
+     */
+    const totals =
+      await env.MEMBERS_DB.prepare(`
+        SELECT
+          SUM(
+            CASE
+              WHEN p.err_code = '20000'
+              THEN 1
+              ELSE 0
+            END
+          ) AS success,
+
+          SUM(
+            CASE
+              WHEN p.err_code IN (
+                '40008',
+                '40011'
+              )
+              THEN 1
+              ELSE 0
+            END
+          ) AS already,
+
+          SUM(
+            CASE
+              WHEN p.err_code NOT IN (
+                '20000',
+                '40008',
+                '40011'
+              )
+              THEN 1
+              ELSE 0
+            END
+          ) AS failed
+
+        FROM members m
+        JOIN processed_codes p
+          ON p.member_id = m.id
+          AND p.code = ?
+
+        WHERE m.active = 1
+      `)
+        .bind(code)
+        .first();
+
+    const success =
+      Number(totals?.success || 0);
+
+    const already =
+      Number(totals?.already || 0);
+
+    const failed =
+      Number(totals?.failed || 0);
+
+    /*
+     * Discord通知済みか再確認。
+     */
+    const job =
+      await env.MEMBERS_DB.prepare(`
+        SELECT notified
+        FROM code_jobs
+        WHERE code = ?
+      `)
+        .bind(code)
+        .first();
+
+    if (
+      Number(job?.notified || 0) === 1
+    ) {
+      return;
+    }
+
+    /*
+     * 全員完了後に1回だけ通知。
+     */
+    await sendDiscord(
+      env,
+      `🎁 **ギフトコード自動交換結果**
 コード：\`${code}\`
 ✅ 受取成功：${success}人
 ☑️ 受取済み：${already}人
-🔄 再試行待ち：${retry}人
-⚠️ その他：${failed}人`;
-
-
-  /*
-   * まだ処理対象が残っている場合
-   */
-  if (remaining > 0) {
-
-    content +=
-      `\n⏳ 未処理・再試行：${remaining}人`;
-
-  } else {
-
-    content +=
-      `\n🏁 全登録者の処理完了`;
-  }
-
-
-  try {
-
-    await sendDiscord(
-      env,
-      content,
+⚠️ その他：${failed}人
+🏁 全登録者の処理完了`,
     );
-
-  } catch (error) {
 
     /*
-     * Discord通知に失敗しても
-     * 交換結果そのものは消さない。
+     * Discord送信成功後にだけ
+     * notified = 1 にする。
+     *
+     * Discord送信に失敗した場合は
+     * ここまで来ないので、
+     * 次回Cronで通知を再試行できる。
      */
-    console.error(
-      "Discord result send error:",
-      error,
+    await env.MEMBERS_DB.prepare(`
+      UPDATE code_jobs
+      SET notified = 1
+      WHERE code = ?
+    `)
+      .bind(code)
+      .run();
+
+    console.log(
+      `code ${code}: completed and notified`,
     );
+
+  } finally {
+    /*
+     * 成功・失敗に関係なくロック解除。
+     */
+    await env.MEMBERS_DB.prepare(`
+      UPDATE code_jobs
+      SET locked_until = 0
+      WHERE code = ?
+    `)
+      .bind(code)
+      .run();
   }
 }
-
 
 /* =========================================================
    ホワサバAPI
