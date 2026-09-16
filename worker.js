@@ -6,6 +6,21 @@ const WOS_API =
 
 const WOS_KEY = "tB87#kPtkxqOS2";
 
+/*
+ * 1回のCronで処理する最大人数。
+ *
+ * Cloudflare Freeプランの制限に余裕を持たせるため、
+ * 一度に全員を無理に処理せず、
+ * 残った人は次の毎分Cronで処理する。
+ */
+const MAX_MEMBERS_PER_RUN = 20;
+
+/*
+ * 1人あたりの通信タイムアウト
+ */
+const REDEEM_TIMEOUT_MS = 12000;
+
+
 export default {
   async fetch(request, env) {
     await ensureDatabase(env);
@@ -25,7 +40,8 @@ export default {
     ) {
       return new Response(REGISTRATION_PAGE, {
         headers: {
-          "Content-Type": "text/html; charset=UTF-8",
+          "Content-Type":
+            "text/html; charset=UTF-8",
         },
       });
     }
@@ -35,19 +51,50 @@ export default {
     });
   },
 
+
   async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(runScheduled(env));
+    /*
+     * Cronの処理をCloudflareに待ってもらう。
+     */
+    ctx.waitUntil(
+      runScheduled(env).catch((error) => {
+        console.error(
+          "scheduled error:",
+          error,
+        );
+      }),
+    );
   },
 };
 
+
+/* =========================================================
+   Cron
+========================================================= */
+
 async function runScheduled(env) {
   await ensureDatabase(env);
-  await checkDiscord(env);
+
+  try {
+    await checkDiscord(env);
+  } catch (error) {
+    console.error(
+      "checkDiscord error:",
+      error,
+    );
+  }
 }
+
+
+/* =========================================================
+   Database
+========================================================= */
 
 async function ensureDatabase(env) {
   if (!env.MEMBERS_DB) {
-    throw new Error("MEMBERS_DB が未設定です");
+    throw new Error(
+      "MEMBERS_DB が未設定です",
+    );
   }
 
   await env.MEMBERS_DB.batch([
@@ -75,6 +122,9 @@ async function ensureDatabase(env) {
     `),
   ]);
 
+  /*
+   * 管理者アカウント
+   */
   await env.MEMBERS_DB.prepare(`
     INSERT OR IGNORE INTO members
     (
@@ -92,8 +142,17 @@ async function ensureDatabase(env) {
     .run();
 }
 
-async function registerMember(request, env) {
-  const form = await request.formData();
+
+/* =========================================================
+   登録
+========================================================= */
+
+async function registerMember(
+  request,
+  env,
+) {
+  const form =
+    await request.formData();
 
   const playerName = String(
     form.get("player_name") || "",
@@ -107,6 +166,7 @@ async function registerMember(request, env) {
     form.get("kingdom_id") || "",
   ).trim();
 
+
   if (
     playerName.length < 1 ||
     playerName.length > 30
@@ -118,6 +178,7 @@ async function registerMember(request, env) {
     );
   }
 
+
   if (!/^\d{6,15}$/.test(playerId)) {
     return pageMessage(
       "登録できません",
@@ -125,6 +186,7 @@ async function registerMember(request, env) {
       false,
     );
   }
+
 
   if (
     !/^\d{1,6}$/.test(kingdomId) ||
@@ -137,6 +199,7 @@ async function registerMember(request, env) {
     );
   }
 
+
   const count =
     await env.MEMBERS_DB.prepare(`
       SELECT COUNT(*) AS total
@@ -144,13 +207,17 @@ async function registerMember(request, env) {
       WHERE active = 1
     `).first();
 
-  if (Number(count?.total || 0) >= 500) {
+
+  if (
+    Number(count?.total || 0) >= 500
+  ) {
     return pageMessage(
       "登録できません",
       "登録上限に達しています。管理者へ連絡してください。",
       false,
     );
   }
+
 
   try {
     await env.MEMBERS_DB.prepare(`
@@ -168,8 +235,14 @@ async function registerMember(request, env) {
         kingdomId,
       )
       .run();
+
   } catch (error) {
-    if (String(error).includes("UNIQUE")) {
+
+    if (
+      String(error).includes(
+        "UNIQUE",
+      )
+    ) {
       return pageMessage(
         "登録済みです",
         "このプレイヤーIDと王国番号はすでに登録されています。",
@@ -180,14 +253,24 @@ async function registerMember(request, env) {
     throw error;
   }
 
+
   return pageMessage(
     "登録完了！",
-    `${escapeHtml(playerName)}さんを王国${escapeHtml(
+
+    `${escapeHtml(
+      playerName,
+    )}さんを王国${escapeHtml(
       kingdomId,
     )}で登録しました。次回から新しいギフトコードを自動受取します。`,
+
     true,
   );
 }
+
+
+/* =========================================================
+   Discordからコード取得
+========================================================= */
 
 async function checkDiscord(env) {
   if (!env.DISCORD_BOT_TOKEN) {
@@ -195,6 +278,7 @@ async function checkDiscord(env) {
       "DISCORD_BOT_TOKEN が未設定です",
     );
   }
+
 
   const response = await fetch(
     `https://discord.com/api/v10/channels/${SOURCE_CHANNEL}/messages?limit=20`,
@@ -204,10 +288,11 @@ async function checkDiscord(env) {
           `Bot ${env.DISCORD_BOT_TOKEN}`,
 
         "User-Agent":
-          "WOSGiftAuto (https://workers.cloudflare.com, 2.0)",
+          "WOSGiftAuto (Cloudflare Workers, 3.0)",
       },
     },
   );
+
 
   if (!response.ok) {
     throw new Error(
@@ -215,27 +300,39 @@ async function checkDiscord(env) {
     );
   }
 
-  const messages = await response.json();
+
+  const messages =
+    await response.json();
+
   const codes = new Set();
 
+
+  /*
+   * 古いメッセージ → 新しいメッセージ
+   */
   for (
-    const message of [...messages].reverse()
+    const message of
+      [...messages].reverse()
   ) {
+
     const text = [
       message.content || "",
 
-      ...(message.embeds || []).flatMap(
-        (embed) => [
-          embed.title || "",
-          embed.description || "",
+      ...(message.embeds || [])
+        .flatMap(
+          (embed) => [
+            embed.title || "",
+            embed.description || "",
 
-          ...(embed.fields || []).map(
-            (field) =>
-              `${field.name} ${field.value}`,
-          ),
-        ],
-      ),
+            ...(embed.fields || [])
+              .map(
+                (field) =>
+                  `${field.name} ${field.value}`,
+              ),
+          ],
+        ),
     ].join("\n");
+
 
     for (
       const match of text.matchAll(
@@ -246,18 +343,48 @@ async function checkDiscord(env) {
     }
   }
 
+
+  /*
+   * コードを順番に処理
+   */
   for (const code of codes) {
-    await processCodeForMembers(
-      code,
-      env,
-    );
+
+    try {
+      await processCodeForMembers(
+        code,
+        env,
+      );
+
+    } catch (error) {
+
+      /*
+       * 1つのコードで問題が起きても
+       * 他のコードの処理は続ける
+       */
+      console.error(
+        `code ${code} error:`,
+        error,
+      );
+    }
   }
 }
+
+
+/* =========================================================
+   コードを登録者へ配布
+========================================================= */
 
 async function processCodeForMembers(
   code,
   env,
 ) {
+
+  /*
+   * まだこのコードを処理していない人だけ取得。
+   *
+   * 一度に最大20人。
+   * 残りは次のCronで自動的に取得される。
+   */
   const { results: members = [] } =
     await env.MEMBERS_DB.prepare(`
       SELECT
@@ -265,99 +392,213 @@ async function processCodeForMembers(
         m.player_name,
         m.player_id,
         m.kingdom_id
+
       FROM members m
+
       LEFT JOIN processed_codes p
         ON p.member_id = m.id
         AND p.code = ?
-      WHERE m.active = 1
+
+      WHERE
+        m.active = 1
         AND p.member_id IS NULL
+
       ORDER BY m.id
-      LIMIT 500
+
+      LIMIT ?
     `)
-      .bind(code)
+      .bind(
+        code,
+        MAX_MEMBERS_PER_RUN,
+      )
       .all();
+
 
   if (members.length === 0) {
     return;
   }
+
 
   let success = 0;
   let already = 0;
   let failed = 0;
   let retry = 0;
 
-  /*
-   * 保存して処理を終了する結果。
-   *
-   * これ以外のエラーは処理済みに保存せず、
-   * 次の毎分処理で自動的に再試行する。
-   */
-  const finalCodes = new Set([
-    "20000", // 受取成功
-    "40005", // 無効コードなど
-    "40006", // 無効コードなど
-    "40007", // 期限・時刻エラー
-    "40008", // 受取済み
-    "40010", // 交換不可
-    "40011", // 同種報酬を交換済み
-    "40014", // プレイヤー情報エラー
-    "40020", // 王国・プレイヤー情報エラー
-  ]);
 
+  /*
+   * このエラーコードは
+   * 「処理終了」としてDBに保存する。
+   *
+   * 保存されなかったものは
+   * 次の毎分Cronで再試行される。
+   */
+  const finalCodes =
+    new Set([
+      "20000",
+
+      "40005",
+      "40006",
+      "40007",
+
+      "40008",
+
+      "40010",
+      "40011",
+
+      "40014",
+      "40020",
+    ]);
+
+
+  /*
+   * 1人ずつ処理
+   */
   for (const member of members) {
-    const result = await redeem(
-      code,
-      member.player_id,
-      member.kingdom_id,
-    );
+
+    let result;
+
 
     /*
-     * 40004のタイムアウトや、
-     * 未知の一時的エラーは保存しない。
+     * ★重要
      *
-     * 次の1分後に同じ人へ再送する。
+     * 1人の通信失敗で
+     * 全員の処理が止まらないようにする。
      */
-    if (!finalCodes.has(result.errCode)) {
+    try {
+
+      result = await redeem(
+        code,
+        member.player_id,
+        member.kingdom_id,
+      );
+
+    } catch (error) {
+
+      console.error(
+        `redeem error
+code=${code}
+name=${member.player_name}
+player=${member.player_id}`,
+
+        error,
+      );
+
+
+      /*
+       * DBへ保存しない。
+       *
+       * つまり次のCronで
+       * この人だけ再試行される。
+       */
       retry++;
+
       continue;
     }
 
-    await env.MEMBERS_DB.prepare(`
-      INSERT OR REPLACE
-      INTO processed_codes
-      (
-        code,
-        member_id,
-        err_code,
-        message
-      )
-      VALUES (?, ?, ?, ?)
-    `)
-      .bind(
-        code,
-        member.id,
-        result.errCode,
-        result.message,
-      )
-      .run();
 
-    if (result.errCode === "20000") {
+    console.log(
+      "redeem result:",
+      {
+        code,
+        player:
+          member.player_id,
+        errCode:
+          result.errCode,
+        message:
+          result.message,
+      },
+    );
+
+
+    /*
+     * 一時的なエラー
+     */
+    if (
+      !finalCodes.has(
+        result.errCode,
+      )
+    ) {
+
+      retry++;
+
+      continue;
+    }
+
+
+    /*
+     * 処理終了結果を保存
+     */
+    try {
+
+      await env.MEMBERS_DB.prepare(`
+        INSERT OR REPLACE
+        INTO processed_codes
+        (
+          code,
+          member_id,
+          err_code,
+          message
+        )
+        VALUES (?, ?, ?, ?)
+      `)
+        .bind(
+          code,
+          member.id,
+          result.errCode,
+          result.message,
+        )
+        .run();
+
+    } catch (error) {
+
+      /*
+       * DB保存失敗でも
+       * 他のプレイヤーは続行。
+       *
+       * 保存できなかった人は
+       * 次回また処理される。
+       */
+      console.error(
+        "processed_codes save error:",
+        error,
+      );
+
+      retry++;
+
+      continue;
+    }
+
+
+    /*
+     * 結果集計
+     */
+    if (
+      result.errCode === "20000"
+    ) {
+
       success++;
+
     } else if (
       [
         "40008",
         "40011",
-      ].includes(result.errCode)
+      ].includes(
+        result.errCode,
+      )
     ) {
+
       already++;
+
     } else {
+
       failed++;
     }
   }
 
+
   /*
-   * 全員が再試行待ちの場合、
-   * 毎分Discordへ同じ通知を送らない。
+   * 全員が再試行待ちだった場合は
+   * Discordへ毎分同じ通知を出さない。
    */
   if (
     success +
@@ -368,138 +609,321 @@ async function processCodeForMembers(
     return;
   }
 
-  await sendDiscord(
-    env,
+
+  /*
+   * このコードについて
+   * まだ未処理の人数を確認
+   */
+  let remaining = 0;
+
+  try {
+
+    const row =
+      await env.MEMBERS_DB.prepare(`
+        SELECT COUNT(*) AS total
+
+        FROM members m
+
+        LEFT JOIN processed_codes p
+          ON p.member_id = m.id
+          AND p.code = ?
+
+        WHERE
+          m.active = 1
+          AND p.member_id IS NULL
+      `)
+        .bind(code)
+        .first();
+
+    remaining =
+      Number(
+        row?.total || 0,
+      );
+
+  } catch (error) {
+
+    console.error(
+      "remaining count error:",
+      error,
+    );
+  }
+
+
+  /*
+   * Discord通知
+   */
+  let content =
     `🎁 **ギフトコード自動交換結果**
 コード：\`${code}\`
 ✅ 受取成功：${success}人
 ☑️ 受取済み：${already}人
 🔄 再試行待ち：${retry}人
-⚠️ その他：${failed}人`,
-  );
+⚠️ その他：${failed}人`;
+
+
+  /*
+   * まだ処理対象が残っている場合
+   */
+  if (remaining > 0) {
+
+    content +=
+      `\n⏳ 未処理・再試行：${remaining}人`;
+
+  } else {
+
+    content +=
+      `\n🏁 全登録者の処理完了`;
+  }
+
+
+  try {
+
+    await sendDiscord(
+      env,
+      content,
+    );
+
+  } catch (error) {
+
+    /*
+     * Discord通知に失敗しても
+     * 交換結果そのものは消さない。
+     */
+    console.error(
+      "Discord result send error:",
+      error,
+    );
+  }
 }
+
+
+/* =========================================================
+   ホワサバAPI
+========================================================= */
 
 async function redeem(
   code,
   playerId,
   kingdomId,
 ) {
-  const time = Math.floor(
-    Date.now() / 1000,
-  ).toString();
+
+  const time =
+    Math.floor(
+      Date.now() / 1000,
+    ).toString();
+
 
   const sign = md5(
     `cdk=${code}&fid=${playerId}&kid=${kingdomId}&time=${time}${WOS_KEY}`,
   );
 
-  const body = new URLSearchParams({
-    cdk: code,
-    fid: playerId,
-    kid: kingdomId,
-    time,
-    sign,
-  });
 
-  const response = await fetch(WOS_API, {
-    method: "POST",
+  const body =
+    new URLSearchParams({
+      cdk: code,
+      fid: playerId,
+      kid: kingdomId,
+      time,
+      sign,
+    });
 
-    headers: {
-      "Content-Type":
-        "application/x-www-form-urlencoded",
 
-      Accept:
-        "application/json, text/plain, */*",
+  /*
+   * タイムアウト用
+   */
+  const controller =
+    new AbortController();
 
-      Origin:
-        "https://wos-giftcode.centurygame.com",
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      REDEEM_TIMEOUT_MS,
+    );
 
-      Referer:
-        "https://wos-giftcode.centurygame.com/",
 
-      "User-Agent":
-        "Mozilla/5.0 AppleWebKit/537.36 Chrome/134 Safari/537.36",
-    },
+  let response;
 
-    body: body.toString(),
-  });
+
+  try {
+
+    response =
+      await fetch(
+        WOS_API,
+        {
+          method: "POST",
+
+          headers: {
+            "Content-Type":
+              "application/x-www-form-urlencoded",
+
+            Accept:
+              "application/json, text/plain, */*",
+
+            Origin:
+              "https://wos-giftcode.centurygame.com",
+
+            Referer:
+              "https://wos-giftcode.centurygame.com/",
+
+            "User-Agent":
+              "Mozilla/5.0 AppleWebKit/537.36 Chrome/134 Safari/537.36",
+          },
+
+          body:
+            body.toString(),
+
+          signal:
+            controller.signal,
+        },
+      );
+
+  } finally {
+
+    clearTimeout(timer);
+  }
+
 
   if (!response.ok) {
+
     throw new Error(
       `ホワサバAPIエラー: HTTP ${response.status}`,
     );
   }
 
-  const data = await response.json();
+
+  let data;
+
+
+  try {
+
+    data =
+      await response.json();
+
+  } catch (error) {
+
+    throw new Error(
+      "ホワサバAPIからJSON以外の応答が返りました",
+    );
+  }
+
 
   return {
-    errCode: String(
-      data.err_code ?? "",
-    ),
+    errCode:
+      String(
+        data.err_code ?? "",
+      ),
 
     message:
-      data.msg ?? "",
+      String(
+        data.msg ?? "",
+      ),
   };
 }
+
+
+/* =========================================================
+   Discord送信
+========================================================= */
 
 async function sendDiscord(
   env,
   content,
 ) {
-  const response = await fetch(
-    `https://discord.com/api/v10/channels/${RESULT_CHANNEL}/messages`,
-    {
-      method: "POST",
 
-      headers: {
-        Authorization:
-          `Bot ${env.DISCORD_BOT_TOKEN}`,
+  const response =
+    await fetch(
+      `https://discord.com/api/v10/channels/${RESULT_CHANNEL}/messages`,
+      {
+        method: "POST",
 
-        "Content-Type":
-          "application/json",
+        headers: {
+          Authorization:
+            `Bot ${env.DISCORD_BOT_TOKEN}`,
+
+          "Content-Type":
+            "application/json",
+        },
+
+        body:
+          JSON.stringify({
+            content,
+          }),
       },
+    );
 
-      body: JSON.stringify({
-        content,
-      }),
-    },
-  );
 
   if (!response.ok) {
+
+    const text =
+      await response.text();
+
     throw new Error(
-      `Discord送信エラー: HTTP ${response.status}`,
+      `Discord送信エラー: HTTP ${response.status} ${text}`,
     );
   }
 }
+
+
+/* =========================================================
+   登録完了ページ
+========================================================= */
 
 function pageMessage(
   title,
   message,
   ok,
 ) {
+
   return new Response(
     `<!doctype html>
+
 <html lang="ja">
+
+<head>
+
+<meta charset="UTF-8">
+
 <meta
   name="viewport"
   content="width=device-width,initial-scale=1"
 >
-<style>${PAGE_STYLE}</style>
+
+<title>
+${title}
+</title>
+
+<style>
+${PAGE_STYLE}
+</style>
+
+</head>
+
 
 <body>
-  <main>
-    <div class="mark">
-      ${ok ? "✓" : "!"}
-    </div>
 
-    <h1>${title}</h1>
+<main>
 
-    <p>${message}</p>
+<div class="mark">
+${ok ? "✓" : "!"}
+</div>
 
-    <a href="/">
-      登録画面へ戻る
-    </a>
-  </main>
+<h1>
+${title}
+</h1>
+
+<p>
+${message}
+</p>
+
+<a href="/">
+登録画面へ戻る
+</a>
+
+</main>
+
 </body>
+
 </html>`,
 
     {
@@ -514,8 +938,14 @@ function pageMessage(
   );
 }
 
+
+/* =========================================================
+   HTML escape
+========================================================= */
+
 function escapeHtml(value) {
-  return value.replace(
+
+  return String(value).replace(
     /[&<>"']/g,
 
     (char) =>
@@ -529,6 +959,11 @@ function escapeHtml(value) {
   );
 }
 
+
+/* =========================================================
+   登録ページ
+========================================================= */
+
 const PAGE_STYLE = `
 * {
   box-sizing: border-box;
@@ -536,430 +971,889 @@ const PAGE_STYLE = `
 
 body {
   margin: 0;
-  background: #071426;
-  color: #f7fbff;
+
+  background:
+    #071426;
+
+  color:
+    #f7fbff;
+
   font-family:
     -apple-system,
     BlinkMacSystemFont,
     "Segoe UI",
     sans-serif;
-  min-height: 100vh;
-  display: grid;
-  place-items: center;
-  padding: 22px;
+
+  min-height:
+    100vh;
+
+  display:
+    grid;
+
+  place-items:
+    center;
+
+  padding:
+    22px;
 }
 
+
 main {
-  width: min(100%, 440px);
+  width:
+    min(100%, 440px);
+
   background:
     linear-gradient(
       145deg,
       #102746,
       #0b1c33
     );
-  border: 1px solid #27466e;
-  border-radius: 26px;
-  padding: 30px;
+
+  border:
+    1px solid #27466e;
+
+  border-radius:
+    26px;
+
+  padding:
+    30px;
+
   box-shadow:
     0 24px 70px #0008;
 }
 
+
 h1 {
-  margin: 8px 0 12px;
-  font-size: 28px;
+  margin:
+    8px 0 12px;
+
+  font-size:
+    28px;
 }
 
+
 p {
-  color: #b9c9dc;
-  line-height: 1.7;
+  color:
+    #b9c9dc;
+
+  line-height:
+    1.7;
 }
+
 
 .logo,
 .mark {
-  width: 58px;
-  height: 58px;
-  display: grid;
-  place-items: center;
-  border-radius: 18px;
-  background: #ffb229;
-  color: #111;
-  font-size: 30px;
-  font-weight: 800;
+  width:
+    58px;
+
+  height:
+    58px;
+
+  display:
+    grid;
+
+  place-items:
+    center;
+
+  border-radius:
+    18px;
+
+  background:
+    #ffb229;
+
+  color:
+    #111;
+
+  font-size:
+    30px;
+
+  font-weight:
+    800;
 }
+
 
 label {
-  display: block;
-  margin: 18px 0 7px;
-  color: #d9e6f4;
-  font-weight: 700;
+  display:
+    block;
+
+  margin:
+    18px 0 7px;
+
+  color:
+    #d9e6f4;
+
+  font-weight:
+    700;
 }
+
 
 input {
-  width: 100%;
+  width:
+    100%;
+
   border:
     1px solid #36567d;
-  background: #07172b;
-  color: white;
-  border-radius: 13px;
-  padding: 15px;
-  font-size: 17px;
-  outline: none;
+
+  background:
+    #07172b;
+
+  color:
+    white;
+
+  border-radius:
+    13px;
+
+  padding:
+    15px;
+
+  font-size:
+    17px;
+
+  outline:
+    none;
 }
 
+
 input:focus {
-  border-color: #ffb229;
+  border-color:
+    #ffb229;
+
   box-shadow:
     0 0 0 3px #ffb22922;
 }
 
-button,
-a {
-  display: block;
-  width: 100%;
-  margin-top: 24px;
-  border: 0;
-  border-radius: 14px;
-  padding: 16px;
-  background: #ffb229;
-  color: #15100a;
-  text-align: center;
-  text-decoration: none;
-  font-size: 17px;
-  font-weight: 800;
+
+button {
+  width:
+    100%;
+
+  margin-top:
+    24px;
+
+  border:
+    0;
+
+  border-radius:
+    14px;
+
+  padding:
+    16px;
+
+  background:
+    #ffb229;
+
+  color:
+    #111;
+
+  font-size:
+    17px;
+
+  font-weight:
+    800;
+
+  cursor:
+    pointer;
 }
 
-.note {
-  font-size: 13px;
-  color: #849ab3;
-  margin-top: 16px;
+
+button:active {
+  transform:
+    scale(0.98);
+}
+
+
+a {
+  display:
+    inline-block;
+
+  margin-top:
+    20px;
+
+  color:
+    #ffbd48;
+
+  text-decoration:
+    none;
+
+  font-weight:
+    700;
+}
+
+
+small {
+  display:
+    block;
+
+  margin-top:
+    8px;
+
+  color:
+    #7890aa;
+
+  line-height:
+    1.5;
 }
 `;
+
+
+/* =========================================================
+   登録フォームHTML
+========================================================= */
 
 const REGISTRATION_PAGE = `
 <!doctype html>
+
 <html lang="ja">
+
 <head>
-  <meta charset="UTF-8">
 
-  <meta
-    name="viewport"
-    content="width=device-width,initial-scale=1"
-  >
+<meta charset="UTF-8">
 
-  <title>
-    ホワサバ ギフトコード自動受取
-  </title>
+<meta
+  name="viewport"
+  content="width=device-width,initial-scale=1"
+>
 
-  <style>
-    ${PAGE_STYLE}
-  </style>
+<title>
+ホワサバ ギフトコード自動受取
+</title>
+
+<style>
+${PAGE_STYLE}
+</style>
+
 </head>
 
+
 <body>
-  <main>
-    <div class="logo">
-      🎁
-    </div>
 
-    <h1>
-      ギフトコード自動受取
-    </h1>
+<main>
 
-    <p>
-      一度登録すると、
-      新しいギフトコードを検知した際に
-      自動で交換します。
-    </p>
+<div class="logo">
+🎁
+</div>
 
-    <form
-      method="post"
-      action="/register"
-    >
-      <label>
-        ゲーム内の名前
-      </label>
 
-      <input
-        name="player_name"
-        maxlength="30"
-        required
-        placeholder="例：シュガー"
-      >
+<h1>
+ギフトコード自動受取
+</h1>
 
-      <label>
-        プレイヤーID
-      </label>
 
-      <input
-        name="player_id"
-        inputmode="numeric"
-        pattern="[0-9]*"
-        required
-        placeholder="例：441788306"
-      >
+<p>
+プレイヤー情報を登録すると、
+新しいギフトコードを検知した際に
+自動で受取処理を行います。
+</p>
 
-      <label>
-        王国番号
-      </label>
 
-      <input
-        name="kingdom_id"
-        inputmode="numeric"
-        pattern="[0-9]*"
-        required
-        placeholder="例：3338"
-      >
+<form
+  method="POST"
+  action="/register"
+>
 
-      <button type="submit">
-        自動受取に登録する
-      </button>
-    </form>
 
-    <div class="note">
-      ゲームのログイン情報は不要です。
-      同じIDと王国番号は
-      重複登録されません。
-    </div>
-  </main>
+<label>
+プレイヤー名
+</label>
+
+<input
+  type="text"
+  name="player_name"
+  maxlength="30"
+  placeholder="ゲーム内の名前"
+  required
+>
+
+
+<label>
+プレイヤーID
+</label>
+
+<input
+  type="text"
+  name="player_id"
+  inputmode="numeric"
+  pattern="[0-9]*"
+  placeholder="例：441788306"
+  required
+>
+
+
+<label>
+王国番号
+</label>
+
+<input
+  type="text"
+  name="kingdom_id"
+  inputmode="numeric"
+  pattern="[0-9]*"
+  placeholder="例：3338"
+  required
+>
+
+
+<button type="submit">
+登録する
+</button>
+
+
+<small>
+登録済みのプレイヤーは、
+同じプレイヤーID・王国番号で
+重複登録されません。
+</small>
+
+
+</form>
+
+</main>
+
 </body>
+
 </html>
 `;
 
-function md5(input) {
-  const add = (a, b) =>
-    (a + b) & 0xffffffff;
 
-  const cmn = (
-    q,
-    a,
-    b,
+/* =========================================================
+   MD5
+========================================================= */
+
+/*
+ * 外部ライブラリなしで動くMD5
+ */
+function md5(string) {
+
+  function rotateLeft(
+    value,
+    shift,
+  ) {
+    return (
+      (value << shift) |
+      (value >>> (32 - shift))
+    );
+  }
+
+
+  function addUnsigned(
     x,
-    s,
-    t,
-  ) => {
-    const n = add(
-      add(a, q),
-      add(x, t),
-    );
+    y,
+  ) {
 
-    return add(
-      (n << s) |
-        (n >>> (32 - s)),
-      b,
-    );
-  };
+    const x4 =
+      x & 0x40000000;
 
-  const ff = (
+    const y4 =
+      y & 0x40000000;
+
+    const x8 =
+      x & 0x80000000;
+
+    const y8 =
+      y & 0x80000000;
+
+    const result =
+      (x & 0x3fffffff) +
+      (y & 0x3fffffff);
+
+
+    if (x4 & y4) {
+      return (
+        result ^
+        0x80000000 ^
+        x8 ^
+        y8
+      );
+    }
+
+
+    if (x4 | y4) {
+
+      if (
+        result &
+        0x40000000
+      ) {
+        return (
+          result ^
+          0xc0000000 ^
+          x8 ^
+          y8
+        );
+      }
+
+      return (
+        result ^
+        0x40000000 ^
+        x8 ^
+        y8
+      );
+    }
+
+
+    return (
+      result ^
+      x8 ^
+      y8
+    );
+  }
+
+
+  function F(
+    x,
+    y,
+    z,
+  ) {
+    return (
+      (x & y) |
+      (~x & z)
+    );
+  }
+
+
+  function G(
+    x,
+    y,
+    z,
+  ) {
+    return (
+      (x & z) |
+      (y & ~z)
+    );
+  }
+
+
+  function H(
+    x,
+    y,
+    z,
+  ) {
+    return (
+      x ^ y ^ z
+    );
+  }
+
+
+  function I(
+    x,
+    y,
+    z,
+  ) {
+    return (
+      y ^
+      (x | ~z)
+    );
+  }
+
+
+  function FF(
     a,
     b,
     c,
     d,
     x,
     s,
-    t,
-  ) =>
-    cmn(
-      (b & c) | (~b & d),
-      a,
-      b,
-      x,
-      s,
-      t,
-    );
+    ac,
+  ) {
 
-  const gg = (
+    a =
+      addUnsigned(
+        a,
+        addUnsigned(
+          addUnsigned(
+            F(b, c, d),
+            x,
+          ),
+          ac,
+        ),
+      );
+
+    return addUnsigned(
+      rotateLeft(a, s),
+      b,
+    );
+  }
+
+
+  function GG(
     a,
     b,
     c,
     d,
     x,
     s,
-    t,
-  ) =>
-    cmn(
-      (b & d) | (c & ~d),
-      a,
-      b,
-      x,
-      s,
-      t,
-    );
+    ac,
+  ) {
 
-  const hh = (
+    a =
+      addUnsigned(
+        a,
+        addUnsigned(
+          addUnsigned(
+            G(b, c, d),
+            x,
+          ),
+          ac,
+        ),
+      );
+
+    return addUnsigned(
+      rotateLeft(a, s),
+      b,
+    );
+  }
+
+
+  function HH(
     a,
     b,
     c,
     d,
     x,
     s,
-    t,
-  ) =>
-    cmn(
-      b ^ c ^ d,
-      a,
-      b,
-      x,
-      s,
-      t,
-    );
+    ac,
+  ) {
 
-  const ii = (
+    a =
+      addUnsigned(
+        a,
+        addUnsigned(
+          addUnsigned(
+            H(b, c, d),
+            x,
+          ),
+          ac,
+        ),
+      );
+
+    return addUnsigned(
+      rotateLeft(a, s),
+      b,
+    );
+  }
+
+
+  function II(
     a,
     b,
     c,
     d,
     x,
     s,
-    t,
-  ) =>
-    cmn(
-      c ^ (b | ~d),
-      a,
+    ac,
+  ) {
+
+    a =
+      addUnsigned(
+        a,
+        addUnsigned(
+          addUnsigned(
+            I(b, c, d),
+            x,
+          ),
+          ac,
+        ),
+      );
+
+    return addUnsigned(
+      rotateLeft(a, s),
       b,
-      x,
-      s,
-      t,
     );
+  }
 
-  const bytes =
-    new TextEncoder().encode(input);
 
-  const len = bytes.length;
+  function convertToWordArray(
+    str,
+  ) {
 
-  const total =
-    (((len + 8) >>> 6) + 1) *
-    16;
+    const length =
+      str.length;
+
+    const numberOfWordsTemp1 =
+      length + 8;
+
+    const numberOfWordsTemp2 =
+      (
+        numberOfWordsTemp1 -
+        (numberOfWordsTemp1 % 64)
+      ) / 64;
+
+    const numberOfWords =
+      (numberOfWordsTemp2 + 1) *
+      16;
+
+    const wordArray =
+      new Array(
+        numberOfWords - 1,
+      );
+
+    let bytePosition = 0;
+    let byteCount = 0;
+
+
+    while (
+      byteCount < length
+    ) {
+
+      const wordCount =
+        (
+          byteCount -
+          (byteCount % 4)
+        ) / 4;
+
+      bytePosition =
+        (byteCount % 4) * 8;
+
+      wordArray[wordCount] =
+        (
+          wordArray[wordCount] ||
+          0
+        ) |
+        (
+          str.charCodeAt(
+            byteCount,
+          ) <<
+          bytePosition
+        );
+
+      byteCount++;
+    }
+
+
+    const wordCount =
+      (
+        byteCount -
+        (byteCount % 4)
+      ) / 4;
+
+    bytePosition =
+      (byteCount % 4) * 8;
+
+
+    wordArray[wordCount] =
+      (
+        wordArray[wordCount] ||
+        0
+      ) |
+      (0x80 << bytePosition);
+
+
+    wordArray[
+      numberOfWords - 2
+    ] =
+      length << 3;
+
+    wordArray[
+      numberOfWords - 1
+    ] =
+      length >>> 29;
+
+
+    return wordArray;
+  }
+
+
+  function wordToHex(value) {
+
+    let result = "";
+
+    for (
+      let count = 0;
+      count <= 3;
+      count++
+    ) {
+
+      const byte =
+        (
+          value >>>
+          (count * 8)
+        ) &
+        255;
+
+      result +=
+        (
+          "0" +
+          byte.toString(16)
+        ).slice(-2);
+    }
+
+    return result;
+  }
+
+
+  function utf8Encode(str) {
+
+    return unescape(
+      encodeURIComponent(str),
+    );
+  }
+
 
   const x =
-    new Array(total).fill(0);
+    convertToWordArray(
+      utf8Encode(string),
+    );
+
+
+  let a =
+    0x67452301;
+
+  let b =
+    0xefcdab89;
+
+  let c =
+    0x98badcfe;
+
+  let d =
+    0x10325476;
+
+
+  const S11 = 7;
+  const S12 = 12;
+  const S13 = 17;
+  const S14 = 22;
+
+  const S21 = 5;
+  const S22 = 9;
+  const S23 = 14;
+  const S24 = 20;
+
+  const S31 = 4;
+  const S32 = 11;
+  const S33 = 16;
+  const S34 = 23;
+
+  const S41 = 6;
+  const S42 = 10;
+  const S43 = 15;
+  const S44 = 21;
+
 
   for (
-    let i = 0;
-    i < len;
-    i++
+    let k = 0;
+    k < x.length;
+    k += 16
   ) {
-    x[i >> 2] |=
-      bytes[i] <<
-      ((i % 4) * 8);
+
+    const AA = a;
+    const BB = b;
+    const CC = c;
+    const DD = d;
+
+
+    a = FF(a,b,c,d,x[k+0],S11,0xd76aa478);
+    d = FF(d,a,b,c,x[k+1],S12,0xe8c7b756);
+    c = FF(c,d,a,b,x[k+2],S13,0x242070db);
+    b = FF(b,c,d,a,x[k+3],S14,0xc1bdceee);
+
+    a = FF(a,b,c,d,x[k+4],S11,0xf57c0faf);
+    d = FF(d,a,b,c,x[k+5],S12,0x4787c62a);
+    c = FF(c,d,a,b,x[k+6],S13,0xa8304613);
+    b = FF(b,c,d,a,x[k+7],S14,0xfd469501);
+
+    a = FF(a,b,c,d,x[k+8],S11,0x698098d8);
+    d = FF(d,a,b,c,x[k+9],S12,0x8b44f7af);
+    c = FF(c,d,a,b,x[k+10],S13,0xffff5bb1);
+    b = FF(b,c,d,a,x[k+11],S14,0x895cd7be);
+
+    a = FF(a,b,c,d,x[k+12],S11,0x6b901122);
+    d = FF(d,a,b,c,x[k+13],S12,0xfd987193);
+    c = FF(c,d,a,b,x[k+14],S13,0xa679438e);
+    b = FF(b,c,d,a,x[k+15],S14,0x49b40821);
+
+
+    a = GG(a,b,c,d,x[k+1],S21,0xf61e2562);
+    d = GG(d,a,b,c,x[k+6],S22,0xc040b340);
+    c = GG(c,d,a,b,x[k+11],S23,0x265e5a51);
+    b = GG(b,c,d,a,x[k+0],S24,0xe9b6c7aa);
+
+    a = GG(a,b,c,d,x[k+5],S21,0xd62f105d);
+    d = GG(d,a,b,c,x[k+10],S22,0x02441453);
+    c = GG(c,d,a,b,x[k+15],S23,0xd8a1e681);
+    b = GG(b,c,d,a,x[k+4],S24,0xe7d3fbc8);
+
+    a = GG(a,b,c,d,x[k+9],S21,0x21e1cde6);
+    d = GG(d,a,b,c,x[k+14],S22,0xc33707d6);
+    c = GG(c,d,a,b,x[k+3],S23,0xf4d50d87);
+    b = GG(b,c,d,a,x[k+8],S24,0x455a14ed);
+
+    a = GG(a,b,c,d,x[k+13],S21,0xa9e3e905);
+    d = GG(d,a,b,c,x[k+2],S22,0xfcefa3f8);
+    c = GG(c,d,a,b,x[k+7],S23,0x676f02d9);
+    b = GG(b,c,d,a,x[k+12],S24,0x8d2a4c8a);
+
+
+    a = HH(a,b,c,d,x[k+5],S31,0xfffa3942);
+    d = HH(d,a,b,c,x[k+8],S32,0x8771f681);
+    c = HH(c,d,a,b,x[k+11],S33,0x6d9d6122);
+    b = HH(b,c,d,a,x[k+14],S34,0xfde5380c);
+
+    a = HH(a,b,c,d,x[k+1],S31,0xa4beea44);
+    d = HH(d,a,b,c,x[k+4],S32,0x4bdecfa9);
+    c = HH(c,d,a,b,x[k+7],S33,0xf6bb4b60);
+    b = HH(b,c,d,a,x[k+10],S34,0xbebfbc70);
+
+    a = HH(a,b,c,d,x[k+13],S31,0x289b7ec6);
+    d = HH(d,a,b,c,x[k+0],S32,0xeaa127fa);
+    c = HH(c,d,a,b,x[k+3],S33,0xd4ef3085);
+    b = HH(b,c,d,a,x[k+6],S34,0x04881d05);
+
+    a = HH(a,b,c,d,x[k+9],S31,0xd9d4d039);
+    d = HH(d,a,b,c,x[k+12],S32,0xe6db99e5);
+    c = HH(c,d,a,b,x[k+15],S33,0x1fa27cf8);
+    b = HH(b,c,d,a,x[k+2],S34,0xc4ac5665);
+
+
+    a = II(a,b,c,d,x[k+0],S41,0xf4292244);
+    d = II(d,a,b,c,x[k+7],S42,0x432aff97);
+    c = II(c,d,a,b,x[k+14],S43,0xab9423a7);
+    b = II(b,c,d,a,x[k+5],S44,0xfc93a039);
+
+    a = II(a,b,c,d,x[k+12],S41,0x655b59c3);
+    d = II(d,a,b,c,x[k+3],S42,0x8f0ccc92);
+    c = II(c,d,a,b,x[k+10],S43,0xffeff47d);
+    b = II(b,c,d,a,x[k+1],S44,0x85845dd1);
+
+    a = II(a,b,c,d,x[k+8],S41,0x6fa87e4f);
+    d = II(d,a,b,c,x[k+15],S42,0xfe2ce6e0);
+    c = II(c,d,a,b,x[k+6],S43,0xa3014314);
+    b = II(b,c,d,a,x[k+13],S44,0x4e0811a1);
+
+    a = II(a,b,c,d,x[k+4],S41,0xf7537e82);
+    d = II(d,a,b,c,x[k+11],S42,0xbd3af235);
+    c = II(c,d,a,b,x[k+2],S43,0x2ad7d2bb);
+    b = II(b,c,d,a,x[k+9],S44,0xeb86d391);
+
+
+    a =
+      addUnsigned(
+        a,
+        AA,
+      );
+
+    b =
+      addUnsigned(
+        b,
+        BB,
+      );
+
+    c =
+      addUnsigned(
+        c,
+        CC,
+      );
+
+    d =
+      addUnsigned(
+        d,
+        DD,
+      );
   }
 
-  x[len >> 2] |=
-    0x80 <<
-    ((len % 4) * 8);
 
-  x[total - 2] =
-    len * 8;
-
-  let A = 1732584193;
-  let B = -271733879;
-  let C = -1732584194;
-  let D = 271733878;
-
-  for (
-    let j = 0;
-    j < x.length;
-    j += 16
-  ) {
-    let a = A;
-    let b = B;
-    let c = C;
-    let d = D;
-
-    a=ff(a,b,c,d,x[j],7,-680876936);
-    d=ff(d,a,b,c,x[j+1],12,-389564586);
-    c=ff(c,d,a,b,x[j+2],17,606105819);
-    b=ff(b,c,d,a,x[j+3],22,-1044525330);
-
-    a=ff(a,b,c,d,x[j+4],7,-176418897);
-    d=ff(d,a,b,c,x[j+5],12,1200080426);
-    c=ff(c,d,a,b,x[j+6],17,-1473231341);
-    b=ff(b,c,d,a,x[j+7],22,-45705983);
-
-    a=ff(a,b,c,d,x[j+8],7,1770035416);
-    d=ff(d,a,b,c,x[j+9],12,-1958414417);
-    c=ff(c,d,a,b,x[j+10],17,-42063);
-    b=ff(b,c,d,a,x[j+11],22,-1990404162);
-
-    a=ff(a,b,c,d,x[j+12],7,1804603682);
-    d=ff(d,a,b,c,x[j+13],12,-40341101);
-    c=ff(c,d,a,b,x[j+14],17,-1502002290);
-    b=ff(b,c,d,a,x[j+15],22,1236535329);
-
-    a=gg(a,b,c,d,x[j+1],5,-165796510);
-    d=gg(d,a,b,c,x[j+6],9,-1069501632);
-    c=gg(c,d,a,b,x[j+11],14,643717713);
-    b=gg(b,c,d,a,x[j],20,-373897302);
-
-    a=gg(a,b,c,d,x[j+5],5,-701558691);
-    d=gg(d,a,b,c,x[j+10],9,38016083);
-    c=gg(c,d,a,b,x[j+15],14,-660478335);
-    b=gg(b,c,d,a,x[j+4],20,-405537848);
-
-    a=gg(a,b,c,d,x[j+9],5,568446438);
-    d=gg(d,a,b,c,x[j+14],9,-1019803690);
-    c=gg(c,d,a,b,x[j+3],14,-187363961);
-    b=gg(b,c,d,a,x[j+8],20,1163531501);
-
-    a=gg(a,b,c,d,x[j+13],5,-1444681467);
-    d=gg(d,a,b,c,x[j+2],9,-51403784);
-    c=gg(c,d,a,b,x[j+7],14,1735328473);
-    b=gg(b,c,d,a,x[j+12],20,-1926607734);
-
-    a=hh(a,b,c,d,x[j+5],4,-378558);
-    d=hh(d,a,b,c,x[j+8],11,-2022574463);
-    c=hh(c,d,a,b,x[j+11],16,1839030562);
-    b=hh(b,c,d,a,x[j+14],23,-35309556);
-
-    a=hh(a,b,c,d,x[j+1],4,-1530992060);
-    d=hh(d,a,b,c,x[j+4],11,1272893353);
-    c=hh(c,d,a,b,x[j+7],16,-155497632);
-    b=hh(b,c,d,a,x[j+10],23,-1094730640);
-
-    a=hh(a,b,c,d,x[j+13],4,681279174);
-    d=hh(d,a,b,c,x[j],11,-358537222);
-    c=hh(c,d,a,b,x[j+3],16,-722521979);
-    b=hh(b,c,d,a,x[j+6],23,76029189);
-
-    a=hh(a,b,c,d,x[j+9],4,-640364487);
-    d=hh(d,a,b,c,x[j+12],11,-421815835);
-    c=hh(c,d,a,b,x[j+15],16,530742520);
-    b=hh(b,c,d,a,x[j+2],23,-995338651);
-
-    a=ii(a,b,c,d,x[j],6,-198630844);
-    d=ii(d,a,b,c,x[j+7],10,1126891415);
-    c=ii(c,d,a,b,x[j+14],15,-1416354905);
-    b=ii(b,c,d,a,x[j+5],21,-57434055);
-
-    a=ii(a,b,c,d,x[j+12],6,1700485571);
-    d=ii(d,a,b,c,x[j+3],10,-1894986606);
-    c=ii(c,d,a,b,x[j+10],15,-1051523);
-    b=ii(b,c,d,a,x[j+1],21,-2054922799);
-
-    a=ii(a,b,c,d,x[j+8],6,1873313359);
-    d=ii(d,a,b,c,x[j+15],10,-30611744);
-    c=ii(c,d,a,b,x[j+6],15,-1560198380);
-    b=ii(b,c,d,a,x[j+13],21,1309151649);
-
-    a=ii(a,b,c,d,x[j+4],6,-145523070);
-    d=ii(d,a,b,c,x[j+11],10,-1120210379);
-    c=ii(c,d,a,b,x[j+2],15,718787259);
-    b=ii(b,c,d,a,x[j+9],21,-343485551);
-
-    A = add(A, a);
-    B = add(B, b);
-    C = add(C, c);
-    D = add(D, d);
-  }
-
-  return [A, B, C, D]
-    .map((n) =>
-      [0, 8, 16, 24]
-        .map((s) =>
-          ((n >>> s) & 255)
-            .toString(16)
-            .padStart(2, "0"),
-        )
-        .join(""),
-    )
-    .join("");
+  return (
+    wordToHex(a) +
+    wordToHex(b) +
+    wordToHex(c) +
+    wordToHex(d)
+  ).toLowerCase();
 }
