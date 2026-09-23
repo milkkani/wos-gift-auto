@@ -7,6 +7,17 @@ const WOS_API =
 const WOS_KEY = "tB87#kPtkxqOS2";
 
 /*
+ * 新しく登録した人にも必ず適用する常設コード。
+ * Discordの直近20件から消えても、この4つは処理対象に残す。
+ */
+const PERMANENT_CODES = [
+  "GuDokYTKOR",
+  "2ndYoutubeKR",
+  "1stYoutubeKR",
+  "gogoWOS",
+];
+
+/*
  * 1回のCronで処理する最大人数。
  *
  * Cloudflare Freeプランの制限に余裕を持たせるため、
@@ -98,6 +109,14 @@ async function ensureDatabase(env) {
   }
 
   await env.MEMBERS_DB.batch([
+    /*
+     * 以前の「DBの直近20コードを開き直す」方式を解除する。
+     * 今後はDiscordに現在残っているコードと常設コードだけを使う。
+     */
+    env.MEMBERS_DB.prepare(`
+      DROP TRIGGER IF EXISTS reopen_recent_codes_for_new_member
+    `),
+
     env.MEMBERS_DB.prepare(`
       CREATE TABLE IF NOT EXISTS members (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,7 +138,9 @@ async function ensureDatabase(env) {
         processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY(code, member_id)
       )
-    `),    env.MEMBERS_DB.prepare(`
+    `),
+
+    env.MEMBERS_DB.prepare(`
       CREATE TABLE IF NOT EXISTS code_jobs (
         code TEXT PRIMARY KEY,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -268,7 +289,7 @@ async function registerMember(
       playerName,
     )}さんを王国${escapeHtml(
       kingdomId,
-    )}で登録しました。次回から新しいギフトコードを自動受取します。`,
+    )}で登録しました。約1分後から常設コードと現在有効なギフトコードを順番に自動受取します。`,
 
     true,
   );
@@ -311,7 +332,13 @@ async function checkDiscord(env) {
   const messages =
     await response.json();
 
-  const codes = new Set();
+  /*
+   * 常設コードはDiscordの表示位置に関係なく、
+   * 常に処理対象へ含める。
+   */
+  const codes = new Set(
+    PERMANENT_CODES,
+  );
 
 
   /*
@@ -352,62 +379,88 @@ async function checkDiscord(env) {
 
 
   /*
-   * コードを順番に処理
-   */
-
-    /*
    * Discordで見つけたコードをD1へ保存。
    * ここでは交換処理はまだ行わない。
    */
-
   for (const code of codes) {
-  await env.MEMBERS_DB.prepare(`
-    INSERT OR IGNORE INTO code_jobs (
-      code,
-      notified
-    )
-    VALUES (
-      ?,
-      CASE
-        WHEN EXISTS (
-          SELECT 1
-          FROM processed_codes
-          WHERE code = ?
-        )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM members m
-          LEFT JOIN processed_codes p
-            ON p.member_id = m.id
-            AND p.code = ?
-          WHERE m.active = 1
-            AND p.member_id IS NULL
-        )
-        THEN 1
-        ELSE 0
-      END
-    )
-  `)
-    .bind(
-      code,
-      code,
-      code,
-    )
-    .run();
-}
+    await env.MEMBERS_DB.prepare(`
+      INSERT OR IGNORE INTO code_jobs (
+        code,
+        notified
+      )
+      VALUES (
+        ?,
+        CASE
+          WHEN EXISTS (
+            SELECT 1
+            FROM processed_codes
+            WHERE code = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM members m
+            LEFT JOIN processed_codes p
+              ON p.member_id = m.id
+              AND p.code = ?
+            WHERE m.active = 1
+              AND p.member_id IS NULL
+          )
+          THEN 1
+          ELSE 0
+        END
+      )
+    `)
+      .bind(
+        code,
+        code,
+        code,
+      )
+      .run();
+  }
+
 
   /*
-   * D1に残っている未完了コードを処理する。
-   * Discordの直近20件から消えても処理を継続できる。
+   * 現在有効なコードだけを処理する。
+   *
+   * ・常設4コード
+   * ・Discordの直近20メッセージに現在残っているコード
+   *
+   * notified = 1 の過去コードでも、あとから登録した人が
+   * 未処理なら、その人だけを通知なしで処理する。
+   * Discordから削除された短期コードはここに含まれない。
    */
+  const activeCodes = [
+    ...codes,
+  ];
+
+  const placeholders =
+    activeCodes
+      .map(() => "?")
+      .join(", ");
+
   const { results: jobs = [] } =
     await env.MEMBERS_DB.prepare(`
-      SELECT code
-      FROM code_jobs
-      WHERE notified = 0
-      ORDER BY created_at ASC
+      SELECT j.code
+      FROM code_jobs j
+      WHERE j.code IN (${placeholders})
+        AND (
+          j.notified = 0
+          OR EXISTS (
+            SELECT 1
+            FROM members m
+            LEFT JOIN processed_codes p
+              ON p.member_id = m.id
+              AND p.code = j.code
+            WHERE m.active = 1
+              AND p.member_id IS NULL
+          )
+        )
+      ORDER BY j.created_at ASC
       LIMIT 10
     `)
+      .bind(
+        ...activeCodes,
+      )
       .all();
 
   for (const job of jobs) {
@@ -424,7 +477,6 @@ async function checkDiscord(env) {
     }
   }
 }
-
 
 /* =========================================================
    コードを登録者へ配布
@@ -446,8 +498,19 @@ async function processCodeForMembers(
       UPDATE code_jobs
       SET locked_until = ?
       WHERE code = ?
-        AND notified = 0
         AND locked_until < ?
+        AND (
+          notified = 0
+          OR EXISTS (
+            SELECT 1
+            FROM members m
+            LEFT JOIN processed_codes p
+              ON p.member_id = m.id
+              AND p.code = code_jobs.code
+            WHERE m.active = 1
+              AND p.member_id IS NULL
+          )
+        )
     `)
       .bind(
         lockUntil,
@@ -736,6 +799,7 @@ async function processCodeForMembers(
   }
 }
 
+
 /* =========================================================
    ホワサバAPI
 ========================================================= */
@@ -997,7 +1061,6 @@ function escapeHtml(value) {
       })[char],
   );
 }
-
 
 /* =========================================================
    登録ページ
@@ -1352,7 +1415,6 @@ ${PAGE_STYLE}
 
 </html>
 `;
-
 
 /* =========================================================
    MD5
@@ -1778,8 +1840,7 @@ function md5(string) {
     const CC = c;
     const DD = d;
 
-
-    a = FF(a,b,c,d,x[k+0],S11,0xd76aa478);
+      a = FF(a,b,c,d,x[k+0],S11,0xd76aa478);
     d = FF(d,a,b,c,x[k+1],S12,0xe8c7b756);
     c = FF(c,d,a,b,x[k+2],S13,0x242070db);
     b = FF(b,c,d,a,x[k+3],S14,0xc1bdceee);
