@@ -299,6 +299,12 @@ async function ensureDatabase(env) {
 
     /*
      * ギフトコード処理キュー
+     *
+     * next_member_id:
+     * どのmember_idまで探索したかを記録する。
+     *
+     * これによって毎分先頭から全登録者を
+     * 探し直す処理を減らす。
      */
     env.MEMBERS_DB.prepare(`
       CREATE TABLE IF NOT EXISTS code_jobs (
@@ -316,6 +322,10 @@ async function ensureDatabase(env) {
 
         locked_until INTEGER
           NOT NULL
+          DEFAULT 0,
+
+        next_member_id INTEGER
+          NOT NULL
           DEFAULT 0
       )
     `),
@@ -323,14 +333,6 @@ async function ensureDatabase(env) {
 
     /*
      * 登録情報変更申請
-     *
-     * members本体を書き換えるので、
-     * 変更後に古い登録が別件として
-     * 残ることはない。
-     *
-     * このテーブルには
-     * 「何から何へ変更したか」
-     * という履歴だけ残る。
      */
     env.MEMBERS_DB.prepare(`
       CREATE TABLE IF NOT EXISTS change_requests (
@@ -374,7 +376,83 @@ async function ensureDatabase(env) {
       )
     `),
 
+
+    /*
+     * activeな登録者を
+     * id順に取得する処理用
+     */
+    env.MEMBERS_DB.prepare(`
+      CREATE INDEX IF NOT EXISTS
+      idx_members_active_id
+
+      ON members(
+        active,
+        id
+      )
+    `),
+
+
+    /*
+     * member_idから受取履歴を
+     * 削除・検索するとき用
+     */
+    env.MEMBERS_DB.prepare(`
+      CREATE INDEX IF NOT EXISTS
+      idx_processed_codes_member_id
+
+      ON processed_codes(
+        member_id
+      )
+    `),
+
+
+    /*
+     * pending変更申請検索用
+     */
+    env.MEMBERS_DB.prepare(`
+      CREATE INDEX IF NOT EXISTS
+      idx_change_requests_member_status
+
+      ON change_requests(
+        member_id,
+        status
+      )
+    `),
+
   ]);
+
+
+  /*
+   * 既存のcode_jobsには
+   * next_member_id列がないため、
+   * 初回だけ追加する。
+   *
+   * 既に追加済みなら
+   * duplicate columnエラーを無視。
+   */
+  try {
+
+    await env.MEMBERS_DB.prepare(`
+      ALTER TABLE code_jobs
+      ADD COLUMN next_member_id INTEGER
+      NOT NULL
+      DEFAULT 0
+    `).run();
+
+  } catch (error) {
+
+    const text =
+      String(error);
+
+    if (
+      !text.includes(
+        "duplicate column",
+      )
+    ) {
+
+      throw error;
+    }
+  }
 
 
   /*
@@ -398,8 +476,6 @@ async function ensureDatabase(env) {
 
     .run();
 }
-
-
 
 /* =========================================================
    新規登録
@@ -467,9 +543,12 @@ async function registerMember(
       .prepare(`
         SELECT
           COUNT(*) AS total
+
         FROM members
+
         WHERE active = 1
       `)
+
       .first();
 
 
@@ -487,25 +566,39 @@ async function registerMember(
   }
 
 
+  let insertedMemberId = 0;
+
+
   try {
 
-    await env.MEMBERS_DB.prepare(`
-      INSERT INTO members
-      (
-        player_name,
-        player_id,
-        kingdom_id
-      )
-      VALUES (?, ?, ?)
-    `)
+    const inserted =
+      await env.MEMBERS_DB
+        .prepare(`
+          INSERT INTO members
+          (
+            player_name,
+            player_id,
+            kingdom_id
+          )
 
-      .bind(
-        playerName,
-        playerId,
-        kingdomId,
-      )
+          VALUES (?, ?, ?)
+        `)
 
-      .run();
+        .bind(
+          playerName,
+          playerId,
+          kingdomId,
+        )
+
+        .run();
+
+
+    insertedMemberId =
+      Number(
+        inserted?.meta
+          ?.last_row_id || 0,
+      );
+
 
   } catch (error) {
 
@@ -525,6 +618,50 @@ async function registerMember(
 
 
     throw error;
+  }
+
+
+  /*
+   * =====================================================
+   * 新規登録者を既存コードの処理対象に戻す
+   * =====================================================
+   *
+   * 改善版ではcode_jobsが
+   * next_member_idを覚えている。
+   *
+   * 新規登録者のIDは通常、
+   * 既存memberより大きいため、
+   * 完了済みジョブを再度開けば
+   * この新規登録者だけを後から処理できる。
+   *
+   * notifiedを0に戻すことで
+   * 現在Discord上に存在するコードと
+   * 常設コードが次回Cronで処理される。
+   *
+   * next_member_idは戻さない。
+   * 新しいmember_idは既存カーソルより
+   * 大きいため、そのままでよい。
+   */
+  if (
+    insertedMemberId > 0
+  ) {
+
+    await env.MEMBERS_DB
+      .prepare(`
+        UPDATE code_jobs
+
+        SET
+          notified = 0
+
+        WHERE
+          next_member_id < ?
+      `)
+
+      .bind(
+        insertedMemberId,
+      )
+
+      .run();
   }
 
 
@@ -667,7 +804,12 @@ async function lookupMember(
 
 
   /*
-   * 同じ登録者から既に申請が出ていないか
+   * 同じ登録者から既に申請が
+   * 出ていないか確認。
+   *
+   * Part 1で追加した
+   * idx_change_requests_member_status
+   * がここで使われる。
    */
   const pending =
     await env.MEMBERS_DB
@@ -721,8 +863,6 @@ async function lookupMember(
     },
   );
 }
-
-
 
 /* =========================================================
    変更申請を作成
@@ -802,18 +942,40 @@ async function createChangeRequest(
     );
 
 
+  if (
+    !Number.isInteger(memberId) ||
+    memberId < 1
+  ) {
+
+    return pageMessage(
+
+      "申請できません",
+
+      "登録情報が正しくありません。最初からやり直してください。",
+
+      false,
+    );
+  }
+
+
   if (validationError) {
 
     return pageMessage(
+
       "申請できません",
+
       validationError,
+
       false,
     );
   }
 
 
   /*
-   * 元の登録をもう一度確認
+   * 現在の登録情報を取得。
+   *
+   * member_idだけでなく、
+   * 検索時点のID・王国番号も一致するか確認する。
    */
   const member =
     await env.MEMBERS_DB
@@ -1135,6 +1297,8 @@ ID：${newPlayerId}
   );
 }
 
+
+
 /* =========================================================
    Discordで変更申請の承認・却下を確認
 ========================================================= */
@@ -1242,9 +1406,6 @@ async function checkChangeRequestCommands(
 
     /*
      * pending状態の申請だけ取得
-     *
-     * 既に承認・却下済みなら
-     * 次回Cronでも何もしない。
      */
     const changeRequest =
       await env.MEMBERS_DB
@@ -1439,8 +1600,7 @@ async function checkChangeRequestCommands(
       continue;
     }
 
-
-    /*
+      /*
      * 申請後に現在の登録情報が
      * 別の方法で変更されていないか確認。
      *
@@ -1625,7 +1785,7 @@ ID ${currentMember.player_id}`,
 
 
     /*
-     * membersの「同じ1件」をUPDATEする。
+     * membersの同じ1件をUPDATEする。
      *
      * INSERTではないため、
      * 名前・ID・王国番号を変更しても
@@ -1723,19 +1883,17 @@ ID ${currentMember.player_id}`,
 
     /*
      * =====================================================
-     * IDを変更した場合だけ
-     * 旧アカウントのギフト受取履歴を削除
+     * IDを変更した場合
      * =====================================================
      *
-     * member_id自体は同じなので、
-     * この削除をしないと
+     * 同じmember_idの受取履歴を削除する。
      *
-     * 「旧IDで既に受け取ったコード」
+     * さらにcode_jobsのカーソルを
+     * このmemberより前まで戻す。
      *
-     * が新しいIDでも受取済み扱いになる。
-     *
-     * 名前変更・王国変更だけなら
-     * この処理は行わない。
+     * これによって現在有効なコードが
+     * 新しいプレイヤーIDに対して
+     * 再度処理される。
      */
     if (
       playerIdChanged
@@ -1750,6 +1908,45 @@ ID ${currentMember.player_id}`,
 
         .bind(
           changeRequest.member_id,
+        )
+
+        .run();
+
+
+      /*
+       * カーソルを変更対象memberの
+       * 1つ手前まで戻す。
+       *
+       * MINを使う代わりにCASEで
+       * 現在のカーソルより前の場合だけ戻す。
+       */
+      const restartFrom =
+        Math.max(
+          0,
+          Number(
+            changeRequest.member_id,
+          ) - 1,
+        );
+
+
+      await env.MEMBERS_DB
+        .prepare(`
+          UPDATE code_jobs
+
+          SET
+            next_member_id =
+              CASE
+                WHEN next_member_id > ?
+                  THEN ?
+                ELSE next_member_id
+              END,
+
+            notified = 0
+        `)
+
+        .bind(
+          restartFrom,
+          restartFrom,
         )
 
         .run();
@@ -1913,14 +2110,13 @@ async function sendDiscordToChannel(
     throw new Error(
 
       `Discord送信エラー: HTTP ${response.status} ${responseText}`,
+
     );
   }
 
 
   return response.json();
 }
-
-
 
 /* =========================================================
    Discordからギフトコード取得
@@ -2039,8 +2235,28 @@ async function checkDiscord(env) {
 
 
   /*
-   * 見つけたコードを
-   * code_jobsへ保存
+   * =====================================================
+   * 見つけたコードをcode_jobsへ保存
+   * =====================================================
+   *
+   * 旧版ではここで
+   *
+   * members
+   * LEFT JOIN processed_codes
+   *
+   * を使って、
+   * コードごとに未処理者がいるか
+   * 毎分調べていた。
+   *
+   * 改善版ではそれをしない。
+   *
+   * 新しいコードなら
+   * next_member_id = 0
+   * から開始する。
+   *
+   * 既存コードなら
+   * INSERT OR IGNOREなので
+   * DB上の進捗をそのまま維持する。
    */
   for (
     const code of codes
@@ -2052,53 +2268,21 @@ async function checkDiscord(env) {
         INTO code_jobs
         (
           code,
-          notified
+          notified,
+          locked_until,
+          next_member_id
         )
 
         VALUES
         (
           ?,
-
-          CASE
-
-            WHEN EXISTS
-            (
-              SELECT 1
-
-              FROM processed_codes
-
-              WHERE code = ?
-            )
-
-            AND NOT EXISTS
-            (
-              SELECT 1
-
-              FROM members m
-
-              LEFT JOIN
-                processed_codes p
-
-                ON
-                  p.member_id = m.id
-                  AND p.code = ?
-
-              WHERE
-                m.active = 1
-                AND p.member_id IS NULL
-            )
-
-            THEN 1
-
-            ELSE 0
-
-          END
+          0,
+          0,
+          0
         )
       `)
 
       .bind(
-        code,
-        code,
         code,
       )
 
@@ -2115,11 +2299,6 @@ async function checkDiscord(env) {
   ];
 
 
-  /*
-   * PERMANENT_CODESがあるため
-   * 通常ここが0になることはないが
-   * 念のため。
-   */
   if (
     activeCodes.length === 0
   ) {
@@ -2137,7 +2316,29 @@ async function checkDiscord(env) {
 
 
   /*
-   * 処理するコードを取得
+   * =====================================================
+   * 処理が必要なコードだけ取得
+   * =====================================================
+   *
+   * 旧版：
+   *
+   * notified = 0
+   * OR EXISTS (
+   *   members
+   *   LEFT JOIN processed_codes...
+   * )
+   *
+   * という重い判定を毎分行っていた。
+   *
+   * 改善版：
+   *
+   * notified = 0
+   *
+   * だけを見る。
+   *
+   * 新規登録やID変更があった場合は
+   * その時点でnotifiedを0へ戻すので、
+   * 毎分members全体を調べる必要がない。
    */
   const {
     results: jobs = [],
@@ -2146,38 +2347,16 @@ async function checkDiscord(env) {
     await env.MEMBERS_DB
       .prepare(`
         SELECT
-          j.code
+          code
 
-        FROM code_jobs j
+        FROM code_jobs
 
         WHERE
-          j.code IN (${placeholders})
-
-          AND
-          (
-            j.notified = 0
-
-            OR EXISTS
-            (
-              SELECT 1
-
-              FROM members m
-
-              LEFT JOIN
-                processed_codes p
-
-                ON
-                  p.member_id = m.id
-                  AND p.code = j.code
-
-              WHERE
-                m.active = 1
-                AND p.member_id IS NULL
-            )
-          )
+          code IN (${placeholders})
+          AND notified = 0
 
         ORDER BY
-          j.created_at ASC
+          created_at ASC
 
         LIMIT 10
       `)
@@ -2238,7 +2417,14 @@ async function processCodeForMembers(
 
 
   /*
+   * =====================================================
    * このコードの処理権を取得
+   * =====================================================
+   *
+   * 旧版ではロック取得時にも
+   * members + processed_codesを調べていた。
+   *
+   * 改善版はcode_jobsの1行だけを見る。
    */
   const lockResult =
 
@@ -2251,32 +2437,8 @@ async function processCodeForMembers(
 
         WHERE
           code = ?
-
           AND locked_until < ?
-
-          AND
-          (
-            notified = 0
-
-            OR EXISTS
-            (
-              SELECT 1
-
-              FROM members m
-
-              LEFT JOIN
-                processed_codes p
-
-                ON
-                  p.member_id = m.id
-                  AND p.code =
-                    code_jobs.code
-
-              WHERE
-                m.active = 1
-                AND p.member_id IS NULL
-            )
-          )
+          AND notified = 0
       `)
 
       .bind(
@@ -2303,14 +2465,15 @@ async function processCodeForMembers(
 
 
   /*
-   * 他のCronが処理中
+   * 他のCronが処理中、
+   * または既に完了済み。
    */
   if (
     changed === 0
   ) {
 
     console.log(
-      `code ${code}: locked or already notified`,
+      `code ${code}: locked or completed`,
     );
 
     return;
@@ -2320,8 +2483,71 @@ async function processCodeForMembers(
   try {
 
     /*
-     * このコードがまだ未処理の人を
-     * 最大10人取得
+     * 現在の進捗位置を取得。
+     *
+     * code_jobsはPRIMARY KEY(code)なので
+     * 基本的に1行だけ読む。
+     */
+    const job =
+      await env.MEMBERS_DB
+        .prepare(`
+          SELECT
+            next_member_id
+
+          FROM code_jobs
+
+          WHERE
+            code = ?
+
+          LIMIT 1
+        `)
+
+        .bind(
+          code,
+        )
+
+        .first();
+
+
+    const nextMemberId =
+      Number(
+        job?.next_member_id || 0,
+      );
+
+
+    /*
+     * =====================================================
+     * 次の登録者を最大10人取得
+     * =====================================================
+     *
+     * ここが今回一番重要。
+     *
+     * 旧版：
+     *
+     * members全体
+     * LEFT JOIN processed_codes
+     * WHERE p.member_id IS NULL
+     *
+     * ↓
+     *
+     * 毎回「誰が未処理か」を
+     * 過去履歴と照合して探していた。
+     *
+     *
+     * 改善版：
+     *
+     * WHERE
+     *   active = 1
+     *   AND id > 前回位置
+     *
+     * ↓
+     *
+     * 前回処理した人の続きから
+     * 最大10人だけ読む。
+     *
+     * idx_members_active_idを使えるため
+     * 登録者が増えても読み取り量が
+     * 増えにくい。
      */
     const {
       results: members = [],
@@ -2330,36 +2556,50 @@ async function processCodeForMembers(
       await env.MEMBERS_DB
         .prepare(`
           SELECT
-            m.id,
-            m.player_name,
-            m.player_id,
-            m.kingdom_id
+            id,
+            player_name,
+            player_id,
+            kingdom_id
 
-          FROM members m
-
-          LEFT JOIN
-            processed_codes p
-
-            ON
-              p.member_id = m.id
-              AND p.code = ?
+          FROM members
 
           WHERE
-            m.active = 1
-            AND p.member_id IS NULL
+            active = 1
+            AND id > ?
 
           ORDER BY
-            m.id
+            id ASC
 
           LIMIT ?
         `)
 
         .bind(
-          code,
+          nextMemberId,
           MAX_MEMBERS_PER_RUN,
         )
 
         .all();
+
+
+    /*
+     * =====================================================
+     * 次に処理する人が0人
+     * =====================================================
+     *
+     * カーソルより後ろに登録者がいないので
+     * このコードは現時点で全員処理済み。
+     */
+    if (
+      members.length === 0
+    ) {
+
+      await finishCodeJob(
+        code,
+        env,
+      );
+
+      return;
+    }
 
 
     /*
@@ -2386,11 +2626,66 @@ async function processCodeForMembers(
 
 
     /*
+     * このCronで
+     * どこまで進めたか。
+     */
+    let lastCompletedMemberId =
+      nextMemberId;
+
+
+    /*
      * 各登録者を処理
      */
     for (
       const member of members
     ) {
+
+      /*
+       * 念のため、
+       * このコードを既に処理済みなら
+       * APIへ二重送信しない。
+       *
+       * PRIMARY KEY(code, member_id)で
+       * 直接検索できる。
+       */
+      const alreadyProcessed =
+        await env.MEMBERS_DB
+          .prepare(`
+            SELECT 1
+
+            FROM processed_codes
+
+            WHERE
+              code = ?
+              AND member_id = ?
+
+            LIMIT 1
+          `)
+
+          .bind(
+            code,
+            member.id,
+          )
+
+          .first();
+
+
+      if (
+        alreadyProcessed
+      ) {
+
+        /*
+         * 既に処理済みなら
+         * カーソルだけ先へ進められる。
+         */
+        lastCompletedMemberId =
+          Number(
+            member.id,
+          );
+
+        continue;
+      }
+
 
       try {
 
@@ -2428,7 +2723,10 @@ async function processCodeForMembers(
          * 一時的・未知の結果は
          * DBに保存しない。
          *
-         * 次回Cronで再試行する。
+         * このmemberでカーソルを止める。
+         *
+         * 次回Cronではこの人から
+         * 再試行する。
          */
         if (
           !finalCodes.has(
@@ -2442,7 +2740,7 @@ async function processCodeForMembers(
 
           );
 
-          continue;
+          break;
         }
 
 
@@ -2477,14 +2775,27 @@ async function processCodeForMembers(
 
           .run();
 
+
+        /*
+         * この人は最終結果まで確定したので
+         * カーソルを進める。
+         */
+        lastCompletedMemberId =
+          Number(
+            member.id,
+          );
+
+
       } catch (error) {
 
         /*
-         * 1人失敗しても
-         * 残りの人は続行。
+         * 通信失敗など。
          *
-         * DBに保存されないため
-         * 次回Cronで再試行される。
+         * DBへ最終結果を保存せず
+         * カーソルもこの人より先へ進めない。
+         *
+         * これにより次回Cronで
+         * 同じ人から再試行する。
          */
         console.error(
 
@@ -2492,229 +2803,103 @@ async function processCodeForMembers(
 
           error,
         );
+
+
+        break;
       }
     }
 
 
     /*
-     * このコードが
-     * まだ未処理の登録者数
-     */
-    const remainingRow =
-
-      await env.MEMBERS_DB
-        .prepare(`
-          SELECT
-            COUNT(*) AS total
-
-          FROM members m
-
-          LEFT JOIN
-            processed_codes p
-
-            ON
-              p.member_id = m.id
-              AND p.code = ?
-
-          WHERE
-            m.active = 1
-            AND p.member_id IS NULL
-        `)
-
-        .bind(
-          code,
-        )
-
-        .first();
-
-
-    const remaining =
-      Number(
-        remainingRow?.total || 0,
-      );
-
-
-    console.log(
-      `code ${code}: remaining=${remaining}`,
-    );
-
-
-    /*
-     * まだ未処理の人がいる。
-     *
-     * 次の毎分Cronへ回す。
+     * =====================================================
+     * 今回確定した位置までカーソルを保存
+     * =====================================================
      */
     if (
-      remaining > 0
+      lastCompletedMemberId >
+      nextMemberId
     ) {
 
-      return;
-    }
-
-
-    /*
-     * 全員完了したので
-     * 結果を集計
-     */
-    const totals =
-
       await env.MEMBERS_DB
         .prepare(`
-          SELECT
+          UPDATE code_jobs
 
-            SUM(
-              CASE
-                WHEN
-                  p.err_code = '20000'
-                THEN 1
-                ELSE 0
-              END
-            ) AS success,
-
-
-            SUM(
-              CASE
-                WHEN
-                  p.err_code IN
-                  (
-                    '40008',
-                    '40011'
-                  )
-                THEN 1
-                ELSE 0
-              END
-            ) AS already,
-
-
-            SUM(
-              CASE
-                WHEN
-                  p.err_code NOT IN
-                  (
-                    '20000',
-                    '40008',
-                    '40011'
-                  )
-                THEN 1
-                ELSE 0
-              END
-            ) AS failed
-
-
-          FROM members m
-
-          JOIN processed_codes p
-
-            ON
-              p.member_id = m.id
-              AND p.code = ?
-
-          WHERE
-            m.active = 1
-        `)
-
-        .bind(
-          code,
-        )
-
-        .first();
-
-
-    const success =
-      Number(
-        totals?.success || 0,
-      );
-
-
-    const already =
-      Number(
-        totals?.already || 0,
-      );
-
-
-    const failed =
-      Number(
-        totals?.failed || 0,
-      );
-
-
-    /*
-     * 既に結果通知済みか確認
-     */
-    const job =
-
-      await env.MEMBERS_DB
-        .prepare(`
-          SELECT
-            notified
-
-          FROM code_jobs
+          SET
+            next_member_id = ?
 
           WHERE
             code = ?
         `)
 
         .bind(
+          lastCompletedMemberId,
           code,
+        )
+
+        .run();
+    }
+
+
+    /*
+     * =====================================================
+     * 後ろに登録者が残っているか確認
+     * =====================================================
+     *
+     * COUNT(*)やprocessed_codesとのJOINはしない。
+     *
+     * 「次の1人が存在するか」
+     * だけをインデックスから確認する。
+     */
+    const nextMember =
+      await env.MEMBERS_DB
+        .prepare(`
+          SELECT id
+
+          FROM members
+
+          WHERE
+            active = 1
+            AND id > ?
+
+          ORDER BY
+            id ASC
+
+          LIMIT 1
+        `)
+
+        .bind(
+          lastCompletedMemberId,
         )
 
         .first();
 
 
+    /*
+     * 次の人がいる。
+     *
+     * 次回Cronで続きを処理する。
+     */
     if (
-      Number(
-        job?.notified || 0,
-      ) === 1
+      nextMember
     ) {
+
+      console.log(
+        `code ${code}: continue after member ${lastCompletedMemberId}`,
+      );
 
       return;
     }
 
 
     /*
-     * 全員完了後に1回だけ
-     * Discordへ結果通知
+     * 次の人がいないので
+     * 現時点の登録者は全員処理済み。
      */
-    await sendDiscord(
-
+    await finishCodeJob(
+      code,
       env,
-
-      `🎁 **ギフトコード自動交換結果**
-コード：\`${code}\`
-✅ 受取成功：${success}人
-☑️ 受取済み：${already}人
-⚠️ その他：${failed}人
-🏁 全登録者の処理完了`,
     );
 
-
-    /*
-     * Discord送信成功後だけ
-     * notified = 1
-     */
-    await env.MEMBERS_DB
-      .prepare(`
-        UPDATE code_jobs
-
-        SET
-          notified = 1
-
-        WHERE
-          code = ?
-      `)
-
-      .bind(
-        code,
-      )
-
-      .run();
-
-
-    console.log(
-
-      `code ${code}: completed and notified`,
-
-    );
 
   } finally {
 
@@ -2742,6 +2927,310 @@ async function processCodeForMembers(
 }
 
 /* =========================================================
+   コード処理完了
+========================================================= */
+
+async function finishCodeJob(
+  code,
+  env,
+) {
+
+  /*
+   * =====================================================
+   * 結果集計
+   * =====================================================
+   *
+   * この集計は「全員への処理が終わった時」
+   * だけ実行する。
+   *
+   * 毎分実行しないのがポイント。
+   */
+  const {
+    results: rows = [],
+  } =
+
+    await env.MEMBERS_DB
+      .prepare(`
+        SELECT
+          err_code,
+          COUNT(*) AS total
+
+        FROM processed_codes
+
+        WHERE
+          code = ?
+
+        GROUP BY
+          err_code
+      `)
+
+      .bind(
+        code,
+      )
+
+      .all();
+
+
+  let success = 0;
+  let already = 0;
+  let expired = 0;
+  let invalid = 0;
+  let other = 0;
+
+
+  /*
+   * API結果を集計
+   */
+  for (
+    const row of rows
+  ) {
+
+    const errCode =
+      String(
+        row.err_code || "",
+      );
+
+
+    const total =
+      Number(
+        row.total || 0,
+      );
+
+
+    /*
+     * 成功
+     */
+    if (
+      errCode === "20000"
+    ) {
+
+      success += total;
+
+      continue;
+    }
+
+
+    /*
+     * 既に受取済み
+     *
+     * 現行コードで使っている
+     * 40008 / 40014 / 40020 系を
+     * まとめて表示する。
+     */
+    if (
+      errCode === "40008" ||
+      errCode === "40014" ||
+      errCode === "40020"
+    ) {
+
+      already += total;
+
+      continue;
+    }
+
+
+    /*
+     * 無効・期限切れ系
+     */
+    if (
+      errCode === "40005" ||
+      errCode === "40006" ||
+      errCode === "40007"
+    ) {
+
+      expired += total;
+
+      continue;
+    }
+
+
+    /*
+     * その他の確定エラー
+     */
+    if (
+      errCode === "40010" ||
+      errCode === "40011"
+    ) {
+
+      invalid += total;
+
+      continue;
+    }
+
+
+    other += total;
+  }
+
+
+  /*
+   * 合計
+   */
+  const totalProcessed =
+
+    success +
+    already +
+    expired +
+    invalid +
+    other;
+
+
+  /*
+   * =====================================================
+   * Discord通知の二重送信防止
+   * =====================================================
+   *
+   * notified = 0 のときだけ
+   * 1へ変更できる。
+   *
+   * Cronが重なっても
+   * 片方だけが通知担当になる。
+   */
+  const notifyLock =
+    await env.MEMBERS_DB
+      .prepare(`
+        UPDATE code_jobs
+
+        SET
+          notified = 1
+
+        WHERE
+          code = ?
+          AND notified = 0
+      `)
+
+      .bind(
+        code,
+      )
+
+      .run();
+
+
+  const changed =
+    Number(
+
+      notifyLock
+        ?.meta
+        ?.changes ??
+
+      notifyLock
+        ?.changes ??
+
+      0,
+    );
+
+
+  /*
+   * 既に別Cronが通知済み
+   */
+  if (
+    changed === 0
+  ) {
+
+    return;
+  }
+
+
+  /*
+   * =====================================================
+   * Discordへ結果通知
+   * =====================================================
+   */
+  let message =
+
+    `🎁 **ギフトコード処理完了**
+
+コード：
+\`${code}\`
+
+処理人数：${totalProcessed}人
+✅ 受取成功：${success}人
+☑️ 受取済み：${already}人`;
+
+
+  if (
+    expired > 0
+  ) {
+
+    message +=
+      `\n⌛ 無効・期限切れ：${expired}人`;
+  }
+
+
+  if (
+    invalid > 0
+  ) {
+
+    message +=
+      `\n⚠️ その他の確定エラー：${invalid}人`;
+  }
+
+
+  if (
+    other > 0
+  ) {
+
+    message +=
+      `\n❓ その他：${other}人`;
+  }
+
+
+  try {
+
+    await sendDiscordToChannel(
+      env,
+      RESULT_CHANNEL,
+      message,
+    );
+
+  } catch (error) {
+
+    /*
+     * Discord通知だけ失敗した場合、
+     * notifiedを0へ戻す。
+     *
+     * 次回Cronで通知を再試行できる。
+     *
+     * ギフトコード自体は
+     * processed_codesに保存済みなので
+     * 再受取されない。
+     */
+    await env.MEMBERS_DB
+      .prepare(`
+        UPDATE code_jobs
+
+        SET
+          notified = 0
+
+        WHERE
+          code = ?
+      `)
+
+      .bind(
+        code,
+      )
+
+      .run();
+
+
+    throw error;
+  }
+
+
+  console.log(
+
+    `code ${code}: completed, processed=${totalProcessed}`,
+
+  );
+}
+
+
+
+/* =========================================================
+   Whiteout Survival
+   ギフトコード受取
+========================================================= */
+
+/* =========================================================
    ホワサバAPI
 ========================================================= */
 
@@ -2757,6 +3246,9 @@ async function redeem(
     ).toString();
 
 
+  /*
+   * 現行と同じ署名方式を維持
+   */
   const sign =
     md5(
       `cdk=${code}&fid=${playerId}&kid=${kingdomId}&time=${time}${WOS_KEY}`,
@@ -2841,6 +3333,28 @@ async function redeem(
         },
       );
 
+  } catch (error) {
+
+    /*
+     * タイムアウト・通信失敗は
+     * processed_codesへ保存されない。
+     *
+     * そのため次回Cronで再試行される。
+     */
+    if (
+      error?.name ===
+      "AbortError"
+    ) {
+
+      throw new Error(
+        `ホワサバAPIタイムアウト (${REDEEM_TIMEOUT_MS}ms)`,
+      );
+    }
+
+
+    throw error;
+
+
   } finally {
 
     clearTimeout(
@@ -2900,12 +3414,6 @@ async function sendDiscord(
   content,
 ) {
 
-  /*
-   * 共通のDiscord送信関数を使用。
-   *
-   * ギフトコード結果は
-   * RESULT_CHANNELへ送る。
-   */
   return sendDiscordToChannel(
 
     env,
@@ -3040,8 +3548,6 @@ function escapeHtml(
         })[char],
     );
 }
-
-
 
 /* =========================================================
    登録情報編集ページ
@@ -3394,8 +3900,6 @@ ${PAGE_STYLE}
 </html>
 `;
 
-
-
 /* =========================================================
    ページ共通CSS
 ========================================================= */
@@ -3498,6 +4002,10 @@ p {
 
   line-height:
     1.7;
+
+
+  margin:
+    0 0 18px;
 }
 
 
@@ -3512,6 +4020,10 @@ p {
     58px;
 
 
+  border-radius:
+    18px;
+
+
   display:
     grid;
 
@@ -3520,43 +4032,54 @@ p {
     center;
 
 
-  border-radius:
-    18px;
-
-
-  background:
-    #ffb229;
-
-
-  color:
-    #111;
-
-
   font-size:
     30px;
 
 
-  font-weight:
-    800;
+  background:
+    #17385f;
+
+
+  border:
+    1px solid #315b8d;
+
+
+  margin-bottom:
+    18px;
+}
+
+
+form {
+
+  display:
+    grid;
+
+
+  gap:
+    12px;
+
+
+  margin-top:
+    22px;
 }
 
 
 label {
 
-  display:
-    block;
-
-
-  margin:
-    18px 0 7px;
-
-
   color:
-    #d9e6f4;
+    #dce9f7;
+
+
+  font-size:
+    14px;
 
 
   font-weight:
     700;
+
+
+  margin-top:
+    4px;
 }
 
 
@@ -3567,27 +4090,27 @@ input {
 
 
   border:
-    1px solid #36567d;
-
-
-  background:
-    #07172b;
-
-
-  color:
-    white;
+    1px solid #34567d;
 
 
   border-radius:
-    13px;
+    14px;
 
 
   padding:
-    15px;
+    14px 15px;
+
+
+  background:
+    #07182c;
+
+
+  color:
+    #ffffff;
 
 
   font-size:
-    17px;
+    16px;
 
 
   outline:
@@ -3598,46 +4121,46 @@ input {
 input:focus {
 
   border-color:
-    #ffb229;
+    #6ba8ff;
 
 
   box-shadow:
-    0 0 0 3px #ffb22922;
+    0 0 0 3px #6ba8ff22;
 }
 
 
 button {
-
-  width:
-    100%;
-
-
-  margin-top:
-    24px;
-
 
   border:
     0;
 
 
   border-radius:
-    14px;
+    15px;
 
 
   padding:
-    16px;
+    15px 18px;
+
+
+  margin-top:
+    8px;
 
 
   background:
-    #ffb229;
+    linear-gradient(
+      135deg,
+      #3c8cff,
+      #2563eb
+    );
 
 
   color:
-    #111;
+    #ffffff;
 
 
   font-size:
-    17px;
+    16px;
 
 
   font-weight:
@@ -3646,34 +4169,19 @@ button {
 
   cursor:
     pointer;
+
+
+  box-shadow:
+    0 10px 28px #2563eb44;
 }
 
 
 button:active {
 
   transform:
-    scale(
-      0.98
+    translateY(
+      1px
     );
-}
-
-
-a {
-
-  display:
-    inline-block;
-
-
-  color:
-    #ffbd48;
-
-
-  text-decoration:
-    none;
-
-
-  font-weight:
-    700;
 }
 
 
@@ -3683,16 +4191,16 @@ small {
     block;
 
 
-  margin-top:
-    12px;
-
-
   color:
-    #7890aa;
+    #8fa7c1;
 
 
   line-height:
     1.6;
+
+
+  margin-top:
+    6px;
 }
 
 
@@ -3707,45 +4215,22 @@ small {
 
 
   gap:
-    18px;
-
-
-  margin-top:
-    22px;
-}
-
-
-.info-box {
-
-  margin:
-    22px 0;
-
-
-  padding:
-    18px;
-
-
-  background:
-    #07172b;
-
-
-  border:
-    1px solid #36567d;
-
-
-  border-radius:
-    16px;
-}
-
-
-.info-label {
-
-  margin-bottom:
     12px;
 
 
+  margin-top:
+    24px;
+}
+
+
+.page-links a {
+
   color:
-    #ffbd48;
+    #8fc1ff;
+
+
+  text-decoration:
+    none;
 
 
   font-size:
@@ -3753,7 +4238,64 @@ small {
 
 
   font-weight:
+    700;
+}
+
+
+.page-links a:hover {
+
+  text-decoration:
+    underline;
+}
+
+
+.info-box {
+
+  background:
+    #07182c;
+
+
+  border:
+    1px solid #29496e;
+
+
+  border-radius:
+    17px;
+
+
+  padding:
+    16px;
+
+
+  margin:
+    20px 0;
+}
+
+
+.info-label {
+
+  color:
+    #7fa8d5;
+
+
+  font-size:
+    12px;
+
+
+  font-weight:
     800;
+
+
+  text-transform:
+    uppercase;
+
+
+  letter-spacing:
+    .06em;
+
+
+  margin-bottom:
+    8px;
 }
 
 
@@ -3768,15 +4310,15 @@ small {
 
 
   gap:
-    15px;
+    20px;
 
 
   padding:
-    8px 0;
+    9px 0;
 
 
   border-bottom:
-    1px solid #ffffff10;
+    1px solid #173352;
 }
 
 
@@ -3790,11 +4332,15 @@ small {
 .info-row span {
 
   color:
-    #7890aa;
+    #91a8c0;
 }
 
 
 .info-row strong {
+
+  color:
+    #ffffff;
+
 
   text-align:
     right;
@@ -3802,6 +4348,35 @@ small {
 
   overflow-wrap:
     anywhere;
+}
+
+@media (
+  max-width: 520px
+) {
+
+  body {
+
+    padding:
+      14px;
+  }
+
+
+  main {
+
+    padding:
+      23px;
+
+
+    border-radius:
+      22px;
+  }
+
+
+  h1 {
+
+    font-size:
+      25px;
+  }
 }
 `;
 
@@ -3851,8 +4426,14 @@ ${PAGE_STYLE}
 
 
 <p>
+ホワイトアウト・サバイバルの
+ギフトコードを自動で受け取ります。
+</p>
+
+
+<p>
 プレイヤー情報を登録すると、
-新しいギフトコードを検知した際に
+新しいギフトコードが検知された際に
 自動で受取処理を行います。
 </p>
 
@@ -3872,6 +4453,7 @@ ${PAGE_STYLE}
   name="player_name"
   maxlength="30"
   placeholder="ゲーム内の名前"
+  autocomplete="off"
   required
 >
 
@@ -3886,6 +4468,7 @@ ${PAGE_STYLE}
   inputmode="numeric"
   pattern="[0-9]*"
   placeholder="例：441788306"
+  autocomplete="off"
   required
 >
 
@@ -3900,6 +4483,7 @@ ${PAGE_STYLE}
   inputmode="numeric"
   pattern="[0-9]*"
   placeholder="例：3338"
+  autocomplete="off"
   required
 >
 
@@ -3910,9 +4494,14 @@ ${PAGE_STYLE}
 
 
 <small>
-登録済みのプレイヤーは、
-同じプレイヤーID・王国番号で
-重複登録されません。
+登録後、現在有効な常設ギフトコードも
+順番に自動受取します。
+</small>
+
+
+<small>
+ギフトコードの処理には
+少し時間がかかる場合があります。
 </small>
 
 
@@ -3922,7 +4511,7 @@ ${PAGE_STYLE}
 <div class="page-links">
 
 <a href="/manage">
-登録情報を確認・変更する
+登録情報を確認・変更
 </a>
 
 </div>
@@ -3934,236 +4523,68 @@ ${PAGE_STYLE}
 </html>
 `;
 
-
-
 /* =========================================================
    MD5
 ========================================================= */
 
-/*
- * 外部ライブラリなしで動くMD5
- */
-function md5(
-  string,
-) {
+function md5(input) {
 
-  function rotateLeft(
-    value,
-    shift,
-  ) {
+  function safeAdd(x, y) {
+
+    const lsw =
+      (x & 0xffff) +
+      (y & 0xffff);
+
+    const msw =
+      (x >> 16) +
+      (y >> 16) +
+      (lsw >> 16);
 
     return (
-
-      (value << shift) |
-
-      (
-        value >>>
-        (32 - shift)
-      )
+      (msw << 16) |
+      (lsw & 0xffff)
     );
   }
 
 
-  function addUnsigned(
-    x,
-    y,
+  function bitRotateLeft(
+    num,
+    cnt,
   ) {
 
-    const x4 =
-      x & 0x40000000;
-
-
-    const y4 =
-      y & 0x40000000;
-
-
-    const x8 =
-      x & 0x80000000;
-
-
-    const y8 =
-      y & 0x80000000;
-
-
-    const result =
-
-      (
-        x &
-        0x3fffffff
-      )
-
-      +
-
-      (
-        y &
-        0x3fffffff
-      );
-
-
-    if (
-      x4 &
-      y4
-    ) {
-
-      return (
-
-        result ^
-
-        0x80000000 ^
-
-        x8 ^
-
-        y8
-      );
-    }
-
-
-    if (
-      x4 |
-      y4
-    ) {
-
-      if (
-        result &
-        0x40000000
-      ) {
-
-        return (
-
-          result ^
-
-          0xc0000000 ^
-
-          x8 ^
-
-          y8
-        );
-      }
-
-
-      return (
-
-        result ^
-
-        0x40000000 ^
-
-        x8 ^
-
-        y8
-      );
-    }
-
-
     return (
-
-      result ^
-
-      x8 ^
-
-      y8
+      (num << cnt) |
+      (num >>> (32 - cnt))
     );
   }
 
 
-  function F(
-    x,
-    y,
-    z,
-  ) {
-
-    return (
-
-      (x & y) |
-
-      (~x & z)
-    );
-  }
-
-
-  function G(
-    x,
-    y,
-    z,
-  ) {
-
-    return (
-
-      (x & z) |
-
-      (y & ~z)
-    );
-  }
-
-
-  function H(
-    x,
-    y,
-    z,
-  ) {
-
-    return (
-      x ^
-      y ^
-      z
-    );
-  }
-
-
-  function I(
-    x,
-    y,
-    z,
-  ) {
-
-    return (
-
-      y ^
-
-      (
-        x |
-        ~z
-      )
-    );
-  }
-
-
-  function FF(
+  function cmn(
+    q,
     a,
     b,
-    c,
-    d,
     x,
     s,
-    ac,
+    t,
   ) {
 
-    a =
-      addUnsigned(
+    return safeAdd(
 
-        a,
+      bitRotateLeft(
 
-        addUnsigned(
+        safeAdd(
 
-          addUnsigned(
-
-            F(
-              b,
-              c,
-              d,
-            ),
-
-            x,
+          safeAdd(
+            a,
+            q,
           ),
 
-          ac,
+          safeAdd(
+            x,
+            t,
+          ),
         ),
-      );
 
-
-    return addUnsigned(
-
-      rotateLeft(
-        a,
         s,
       ),
 
@@ -4172,295 +4593,393 @@ function md5(
   }
 
 
-  function GG(
+  function ff(
     a,
     b,
     c,
     d,
     x,
     s,
-    ac,
+    t,
   ) {
 
-    a =
-      addUnsigned(
-
-        a,
-
-        addUnsigned(
-
-          addUnsigned(
-
-            G(
-              b,
-              c,
-              d,
-            ),
-
-            x,
-          ),
-
-          ac,
-        ),
-      );
-
-
-    return addUnsigned(
-
-      rotateLeft(
-        a,
-        s,
-      ),
-
+    return cmn(
+      (b & c) |
+      (~b & d),
+      a,
       b,
+      x,
+      s,
+      t,
     );
   }
 
 
-  function HH(
+  function gg(
     a,
     b,
     c,
     d,
     x,
     s,
-    ac,
+    t,
   ) {
 
-    a =
-      addUnsigned(
-
-        a,
-
-        addUnsigned(
-
-          addUnsigned(
-
-            H(
-              b,
-              c,
-              d,
-            ),
-
-            x,
-          ),
-
-          ac,
-        ),
-      );
-
-
-    return addUnsigned(
-
-      rotateLeft(
-        a,
-        s,
-      ),
-
+    return cmn(
+      (b & d) |
+      (c & ~d),
+      a,
       b,
+      x,
+      s,
+      t,
     );
   }
 
 
-  function II(
+  function hh(
     a,
     b,
     c,
     d,
     x,
     s,
-    ac,
+    t,
   ) {
 
-    a =
-      addUnsigned(
-
-        a,
-
-        addUnsigned(
-
-          addUnsigned(
-
-            I(
-              b,
-              c,
-              d,
-            ),
-
-            x,
-          ),
-
-          ac,
-        ),
-      );
-
-
-    return addUnsigned(
-
-      rotateLeft(
-        a,
-        s,
-      ),
-
+    return cmn(
+      b ^ c ^ d,
+      a,
       b,
+      x,
+      s,
+      t,
     );
   }
 
-  function convertToWordArray(
+
+  function ii(
+    a,
+    b,
+    c,
+    d,
+    x,
+    s,
+    t,
+  ) {
+
+    return cmn(
+      c ^ (b | ~d),
+      a,
+      b,
+      x,
+      s,
+      t,
+    );
+  }
+
+
+  function md5Cycle(
+    state,
+    block,
+  ) {
+
+    let a = state[0];
+    let b = state[1];
+    let c = state[2];
+    let d = state[3];
+
+
+    const oa = a;
+    const ob = b;
+    const oc = c;
+    const od = d;
+
+
+    a = ff(a,b,c,d,block[0],7,-680876936);
+    d = ff(d,a,b,c,block[1],12,-389564586);
+    c = ff(c,d,a,b,block[2],17,606105819);
+    b = ff(b,c,d,a,block[3],22,-1044525330);
+
+    a = ff(a,b,c,d,block[4],7,-176418897);
+    d = ff(d,a,b,c,block[5],12,1200080426);
+    c = ff(c,d,a,b,block[6],17,-1473231341);
+    b = ff(b,c,d,a,block[7],22,-45705983);
+
+    a = ff(a,b,c,d,block[8],7,1770035416);
+    d = ff(d,a,b,c,block[9],12,-1958414417);
+    c = ff(c,d,a,b,block[10],17,-42063);
+    b = ff(b,c,d,a,block[11],22,-1990404162);
+
+    a = ff(a,b,c,d,block[12],7,1804603682);
+    d = ff(d,a,b,c,block[13],12,-40341101);
+    c = ff(c,d,a,b,block[14],17,-1502002290);
+    b = ff(b,c,d,a,block[15],22,1236535329);
+
+
+    a = gg(a,b,c,d,block[1],5,-165796510);
+    d = gg(d,a,b,c,block[6],9,-1069501632);
+    c = gg(c,d,a,b,block[11],14,643717713);
+    b = gg(b,c,d,a,block[0],20,-373897302);
+
+    a = gg(a,b,c,d,block[5],5,-701558691);
+    d = gg(d,a,b,c,block[10],9,38016083);
+    c = gg(c,d,a,b,block[15],14,-660478335);
+    b = gg(b,c,d,a,block[4],20,-405537848);
+
+    a = gg(a,b,c,d,block[9],5,568446438);
+    d = gg(d,a,b,c,block[14],9,-1019803690);
+    c = gg(c,d,a,b,block[3],14,-187363961);
+    b = gg(b,c,d,a,block[8],20,1163531501);
+
+    a = gg(a,b,c,d,block[13],5,-1444681467);
+    d = gg(d,a,b,c,block[2],9,-51403784);
+    c = gg(c,d,a,b,block[7],14,1735328473);
+    b = gg(b,c,d,a,block[12],20,-1926607734);
+
+
+    a = hh(a,b,c,d,block[5],4,-378558);
+    d = hh(d,a,b,c,block[8],11,-2022574463);
+    c = hh(c,d,a,b,block[11],16,1839030562);
+    b = hh(b,c,d,a,block[14],23,-35309556);
+
+    a = hh(a,b,c,d,block[1],4,-1530992060);
+    d = hh(d,a,b,c,block[4],11,1272893353);
+    c = hh(c,d,a,b,block[7],16,-155497632);
+    b = hh(b,c,d,a,block[10],23,-1094730640);
+
+    a = hh(a,b,c,d,block[13],4,681279174);
+    d = hh(d,a,b,c,block[0],11,-358537222);
+    c = hh(c,d,a,b,block[3],16,-722521979);
+    b = hh(b,c,d,a,block[6],23,76029189);
+
+    a = hh(a,b,c,d,block[9],4,-640364487);
+    d = hh(d,a,b,c,block[12],11,-421815835);
+    c = hh(c,d,a,b,block[15],16,530742520);
+    b = hh(b,c,d,a,block[2],23,-995338651);
+
+
+    a = ii(a,b,c,d,block[0],6,-198630844);
+    d = ii(d,a,b,c,block[7],10,1126891415);
+    c = ii(c,d,a,b,block[14],15,-1416354905);
+    b = ii(b,c,d,a,block[5],21,-57434055);
+
+    a = ii(a,b,c,d,block[12],6,1700485571);
+    d = ii(d,a,b,c,block[3],10,-1894986606);
+    c = ii(c,d,a,b,block[10],15,-1051523);
+    b = ii(b,c,d,a,block[1],21,-2054922799);
+
+    a = ii(a,b,c,d,block[8],6,1873313359);
+    d = ii(d,a,b,c,block[15],10,-30611744);
+    c = ii(c,d,a,b,block[6],15,-1560198380);
+    b = ii(b,c,d,a,block[13],21,1309151649);
+
+    a = ii(a,b,c,d,block[4],6,-145523070);
+    d = ii(d,a,b,c,block[11],10,-1120210379);
+    c = ii(c,d,a,b,block[2],15,718787259);
+    b = ii(b,c,d,a,block[9],21,-343485551);
+
+
+    state[0] =
+      safeAdd(a, oa);
+
+    state[1] =
+      safeAdd(b, ob);
+
+    state[2] =
+      safeAdd(c, oc);
+
+    state[3] =
+      safeAdd(d, od);
+  }
+
+
+  function md5Block(
     string,
   ) {
 
-    const messageLength =
-      string.length;
+    const block =
+      new Array(16)
+        .fill(0);
 
 
-    const numberOfWordsTemp1 =
-      messageLength + 8;
-
-
-    const numberOfWordsTemp2 =
-      (
-        numberOfWordsTemp1 -
-        (
-          numberOfWordsTemp1 %
-          64
-        )
-      ) / 64;
-
-
-    const numberOfWords =
-      (
-        numberOfWordsTemp2 + 1
-      ) * 16;
-
-
-    const wordArray =
-      new Array(
-        numberOfWords - 1,
-      );
-
-
-    let bytePosition = 0;
-
-    let byteCount = 0;
-
-
-    while (
-      byteCount <
-      messageLength
+    for (
+      let i = 0;
+      i < 64;
+      i += 4
     ) {
 
-      const wordCount =
-        (
-          byteCount -
-          (
-            byteCount % 4
-          )
-        ) / 4;
+      block[i >> 2] =
 
-
-      bytePosition =
-        (
-          byteCount % 4
-        ) * 8;
-
-
-      wordArray[
-        wordCount
-      ] =
-        (
-          wordArray[
-            wordCount
-          ] || 0
-        ) |
+        string.charCodeAt(i) +
 
         (
-          string.charCodeAt(
-            byteCount,
-          ) <<
-          bytePosition
+          string.charCodeAt(i + 1)
+          << 8
+        ) +
+
+        (
+          string.charCodeAt(i + 2)
+          << 16
+        ) +
+
+        (
+          string.charCodeAt(i + 3)
+          << 24
         );
-
-
-      byteCount++;
     }
 
 
-    const wordCount =
-      (
-        byteCount -
-        (
-          byteCount % 4
-        )
-      ) / 4;
-
-
-    bytePosition =
-      (
-        byteCount % 4
-      ) * 8;
-
-
-    wordArray[
-      wordCount
-    ] =
-      (
-        wordArray[
-          wordCount
-        ] || 0
-      ) |
-
-      (
-        0x80 <<
-        bytePosition
-      );
-
-
-    wordArray[
-      numberOfWords - 2
-    ] =
-      messageLength << 3;
-
-
-    wordArray[
-      numberOfWords - 1
-    ] =
-      messageLength >>> 29;
-
-
-    return wordArray;
+    return block;
   }
 
 
-  function wordToHex(
-    value,
+  /*
+   * WOS署名で使用する文字列は
+   * ASCIIだが、念のためUTF-8化。
+   */
+  const string =
+    unescape(
+      encodeURIComponent(
+        String(input),
+      ),
+    );
+
+
+  const state = [
+    1732584193,
+    -271733879,
+    -1732584194,
+    271733878,
+  ];
+
+
+  let index;
+
+
+  for (
+    index = 64;
+    index <= string.length;
+    index += 64
+  ) {
+
+    md5Cycle(
+
+      state,
+
+      md5Block(
+        string.substring(
+          index - 64,
+          index,
+        ),
+      ),
+    );
+  }
+
+
+  const tail =
+    new Array(16)
+      .fill(0);
+
+
+  const remaining =
+    string.substring(
+      index - 64,
+    );
+
+
+  for (
+    let i = 0;
+    i < remaining.length;
+    i++
+  ) {
+
+    tail[i >> 2] |=
+
+      remaining.charCodeAt(i)
+      << (
+        (i % 4) << 3
+      );
+  }
+
+
+  tail[
+    remaining.length >> 2
+  ] |=
+
+    0x80
+    << (
+      (remaining.length % 4)
+      << 3
+    );
+
+
+  if (
+    remaining.length > 55
+  ) {
+
+    md5Cycle(
+      state,
+      tail,
+    );
+
+
+    for (
+      let i = 0;
+      i < 16;
+      i++
+    ) {
+
+      tail[i] = 0;
+    }
+  }
+
+
+  const bitLength =
+    string.length * 8;
+
+
+  tail[14] =
+    bitLength & 0xffffffff;
+
+
+  tail[15] =
+    Math.floor(
+      bitLength /
+      0x100000000,
+    );
+
+
+  md5Cycle(
+    state,
+    tail,
+  );
+
+
+  function hex(
+    number,
   ) {
 
     let result = "";
 
 
     for (
-      let count = 0;
-      count <= 3;
-      count++
+      let j = 0;
+      j < 4;
+      j++
     ) {
 
-      const byte =
-        (
-          value >>>
-          (
-            count * 8
-          )
-        ) &
-        255;
-
-
-      const temp =
-        `0${byte.toString(16)}`;
-
-
       result +=
-        temp.slice(-2);
+        (
+          "0" +
+          (
+            (
+              number >>
+              (j * 8)
+            ) &
+            0xff
+          ).toString(16)
+        ).slice(-2);
     }
 
 
@@ -4468,654 +4987,10 @@ function md5(
   }
 
 
-  function utf8Encode(
-    value,
-  ) {
-
-    value =
-      value.replace(
-        /\r\n/g,
-        "\n",
-      );
-
-
-    let utfText = "";
-
-
-    for (
-      let n = 0;
-      n < value.length;
-      n++
-    ) {
-
-      const c =
-        value.charCodeAt(
-          n,
-        );
-
-
-      if (
-        c < 128
-      ) {
-
-        utfText +=
-          String.fromCharCode(
-            c,
-          );
-
-      } else if (
-        c < 2048
-      ) {
-
-        utfText +=
-          String.fromCharCode(
-            (c >> 6) |
-            192,
-          );
-
-
-        utfText +=
-          String.fromCharCode(
-            (c & 63) |
-            128,
-          );
-
-      } else {
-
-        utfText +=
-          String.fromCharCode(
-            (c >> 12) |
-            224,
-          );
-
-
-        utfText +=
-          String.fromCharCode(
-            (
-              (c >> 6) &
-              63
-            ) |
-            128,
-          );
-
-
-        utfText +=
-          String.fromCharCode(
-            (c & 63) |
-            128,
-          );
-      }
-    }
-
-
-    return utfText;
-  }
-
-
-  string =
-    utf8Encode(
-      string,
-    );
-
-
-  const x =
-    convertToWordArray(
-      string,
-    );
-
-
-  let a =
-    0x67452301;
-
-
-  let b =
-    0xefcdab89;
-
-
-  let c =
-    0x98badcfe;
-
-
-  let d =
-    0x10325476;
-
-
-  const S11 = 7;
-  const S12 = 12;
-  const S13 = 17;
-  const S14 = 22;
-
-  const S21 = 5;
-  const S22 = 9;
-  const S23 = 14;
-  const S24 = 20;
-
-  const S31 = 4;
-  const S32 = 11;
-  const S33 = 16;
-  const S34 = 23;
-
-  const S41 = 6;
-  const S42 = 10;
-  const S43 = 15;
-  const S44 = 21;
-
-
-  for (
-    let k = 0;
-    k < x.length;
-    k += 16
-  ) {
-
-    const AA = a;
-    const BB = b;
-    const CC = c;
-    const DD = d;
-
-
-    /*
-     * Round 1
-     */
-
-    a = FF(
-      a, b, c, d,
-      x[k + 0],
-      S11,
-      0xd76aa478,
-    );
-
-    d = FF(
-      d, a, b, c,
-      x[k + 1],
-      S12,
-      0xe8c7b756,
-    );
-
-    c = FF(
-      c, d, a, b,
-      x[k + 2],
-      S13,
-      0x242070db,
-    );
-
-    b = FF(
-      b, c, d, a,
-      x[k + 3],
-      S14,
-      0xc1bdceee,
-    );
-
-    a = FF(
-      a, b, c, d,
-      x[k + 4],
-      S11,
-      0xf57c0faf,
-    );
-
-    d = FF(
-      d, a, b, c,
-      x[k + 5],
-      S12,
-      0x4787c62a,
-    );
-
-    c = FF(
-      c, d, a, b,
-      x[k + 6],
-      S13,
-      0xa8304613,
-    );
-
-    b = FF(
-      b, c, d, a,
-      x[k + 7],
-      S14,
-      0xfd469501,
-    );
-
-    a = FF(
-      a, b, c, d,
-      x[k + 8],
-      S11,
-      0x698098d8,
-    );
-
-    d = FF(
-      d, a, b, c,
-      x[k + 9],
-      S12,
-      0x8b44f7af,
-    );
-
-    c = FF(
-      c, d, a, b,
-      x[k + 10],
-      S13,
-      0xffff5bb1,
-    );
-
-    b = FF(
-      b, c, d, a,
-      x[k + 11],
-      S14,
-      0x895cd7be,
-    );
-
-    a = FF(
-      a, b, c, d,
-      x[k + 12],
-      S11,
-      0x6b901122,
-    );
-
-    d = FF(
-      d, a, b, c,
-      x[k + 13],
-      S12,
-      0xfd987193,
-    );
-
-    c = FF(
-      c, d, a, b,
-      x[k + 14],
-      S13,
-      0xa679438e,
-    );
-
-    b = FF(
-      b, c, d, a,
-      x[k + 15],
-      S14,
-      0x49b40821,
-    );
-
-
-    /*
-     * Round 2
-     */
-
-    a = GG(
-      a, b, c, d,
-      x[k + 1],
-      S21,
-      0xf61e2562,
-    );
-
-    d = GG(
-      d, a, b, c,
-      x[k + 6],
-      S22,
-      0xc040b340,
-    );
-
-    c = GG(
-      c, d, a, b,
-      x[k + 11],
-      S23,
-      0x265e5a51,
-    );
-
-    b = GG(
-      b, c, d, a,
-      x[k + 0],
-      S24,
-      0xe9b6c7aa,
-    );
-
-    a = GG(
-      a, b, c, d,
-      x[k + 5],
-      S21,
-      0xd62f105d,
-    );
-
-    d = GG(
-      d, a, b, c,
-      x[k + 10],
-      S22,
-      0x02441453,
-    );
-
-    c = GG(
-      c, d, a, b,
-      x[k + 15],
-      S23,
-      0xd8a1e681,
-    );
-
-    b = GG(
-      b, c, d, a,
-      x[k + 4],
-      S24,
-      0xe7d3fbc8,
-    );
-
-    a = GG(
-      a, b, c, d,
-      x[k + 9],
-      S21,
-      0x21e1cde6,
-    );
-
-    d = GG(
-      d, a, b, c,
-      x[k + 14],
-      S22,
-      0xc33707d6,
-    );
-
-    c = GG(
-      c, d, a, b,
-      x[k + 3],
-      S23,
-      0xf4d50d87,
-    );
-
-    b = GG(
-      b, c, d, a,
-      x[k + 8],
-      S24,
-      0x455a14ed,
-    );
-
-    a = GG(
-      a, b, c, d,
-      x[k + 13],
-      S21,
-      0xa9e3e905,
-    );
-
-    d = GG(
-      d, a, b, c,
-      x[k + 2],
-      S22,
-      0xfcefa3f8,
-    );
-
-    c = GG(
-      c, d, a, b,
-      x[k + 7],
-      S23,
-      0x676f02d9,
-    );
-
-    b = GG(
-      b, c, d, a,
-      x[k + 12],
-      S24,
-      0x8d2a4c8a,
-    );
-
-
-    /*
-     * Round 3
-     */
-
-    a = HH(
-      a, b, c, d,
-      x[k + 5],
-      S31,
-      0xfffa3942,
-    );
-
-    d = HH(
-      d, a, b, c,
-      x[k + 8],
-      S32,
-      0x8771f681,
-    );
-
-    c = HH(
-      c, d, a, b,
-      x[k + 11],
-      S33,
-      0x6d9d6122,
-    );
-
-    b = HH(
-      b, c, d, a,
-      x[k + 14],
-      S34,
-      0xfde5380c,
-    );
-
-    a = HH(
-      a, b, c, d,
-      x[k + 1],
-      S31,
-      0xa4beea44,
-    );
-
-    d = HH(
-      d, a, b, c,
-      x[k + 4],
-      S32,
-      0x4bdecfa9,
-    );
-
-    c = HH(
-      c, d, a, b,
-      x[k + 7],
-      S33,
-      0xf6bb4b60,
-    );
-
-    b = HH(
-      b, c, d, a,
-      x[k + 10],
-      S34,
-      0xbebfbc70,
-    );
-
-    a = HH(
-      a, b, c, d,
-      x[k + 13],
-      S31,
-      0x289b7ec6,
-    );
-
-    d = HH(
-      d, a, b, c,
-      x[k + 0],
-      S32,
-      0xeaa127fa,
-    );
-
-    c = HH(
-      c, d, a, b,
-      x[k + 3],
-      S33,
-      0xd4ef3085,
-    );
-
-    b = HH(
-      b, c, d, a,
-      x[k + 6],
-      S34,
-      0x04881d05,
-    );
-
-    a = HH(
-      a, b, c, d,
-      x[k + 9],
-      S31,
-      0xd9d4d039,
-    );
-
-    d = HH(
-      d, a, b, c,
-      x[k + 12],
-      S32,
-      0xe6db99e5,
-    );
-
-    c = HH(
-      c, d, a, b,
-      x[k + 15],
-      S33,
-      0x1fa27cf8,
-    );
-
-    b = HH(
-      b, c, d, a,
-      x[k + 2],
-      S34,
-      0xc4ac5665,
-    );
-
-
-    /*
-     * Round 4
-     */
-
-    a = II(
-      a, b, c, d,
-      x[k + 0],
-      S41,
-      0xf4292244,
-    );
-
-    d = II(
-      d, a, b, c,
-      x[k + 7],
-      S42,
-      0x432aff97,
-    );
-
-    c = II(
-      c, d, a, b,
-      x[k + 14],
-      S43,
-      0xab9423a7,
-    );
-
-    b = II(
-      b, c, d, a,
-      x[k + 5],
-      S44,
-      0xfc93a039,
-    );
-
-    a = II(
-      a, b, c, d,
-      x[k + 12],
-      S41,
-      0x655b59c3,
-    );
-
-    d = II(
-      d, a, b, c,
-      x[k + 3],
-      S42,
-      0x8f0ccc92,
-    );
-
-    c = II(
-      c, d, a, b,
-      x[k + 10],
-      S43,
-      0xffeff47d,
-    );
-
-    b = II(
-      b, c, d, a,
-      x[k + 1],
-      S44,
-      0x85845dd1,
-    );
-
-    a = II(
-      a, b, c, d,
-      x[k + 8],
-      S41,
-      0x6fa87e4f,
-    );
-
-    d = II(
-      d, a, b, c,
-      x[k + 15],
-      S42,
-      0xfe2ce6e0,
-    );
-
-    c = II(
-      c, d, a, b,
-      x[k + 6],
-      S43,
-      0xa3014314,
-    );
-
-    b = II(
-      b, c, d, a,
-      x[k + 13],
-      S44,
-      0x4e0811a1,
-    );
-
-    a = II(
-      a, b, c, d,
-      x[k + 4],
-      S41,
-      0xf7537e82,
-    );
-
-    d = II(
-      d, a, b, c,
-      x[k + 11],
-      S42,
-      0xbd3af235,
-    );
-
-    c = II(
-      c, d, a, b,
-      x[k + 2],
-      S43,
-      0x2ad7d2bb,
-    );
-
-    b = II(
-      b, c, d, a,
-      x[k + 9],
-      S44,
-      0xeb86d391,
-    );
-
-
-    a =
-      addUnsigned(
-        a,
-        AA,
-      );
-
-
-    b =
-      addUnsigned(
-        b,
-        BB,
-      );
-
-
-    c =
-      addUnsigned(
-        c,
-        CC,
-      );
-
-
-    d =
-      addUnsigned(
-        d,
-        DD,
-      );
-  }
-
-
   return (
-
-    wordToHex(a) +
-    wordToHex(b) +
-    wordToHex(c) +
-    wordToHex(d)
-
-  ).toLowerCase();
+    hex(state[0]) +
+    hex(state[1]) +
+    hex(state[2]) +
+    hex(state[3])
+  );
 }
