@@ -121,64 +121,7 @@ export default {
       );
     }
 
-       /*
-     * WOS API 実コードテスト
-     * 一時的なデバッグ用
-     */
-    if (
-      request.method === "GET" &&
-      url.pathname === "/test-wos"
-    ) {
-
-      const testCodes = [
-        "GuDokYTKOR",
-        "2ndYoutubeKR",
-        "1stYoutubeKR",
-        "gogoWOS",
-      ];
-
-      const results = [];
-
-      for (const code of testCodes) {
-
-        try {
-
-          const result =
-            await redeem(
-              code,
-              "743050483",
-              "3265",
-            );
-
-          results.push({
-            code,
-            ...result,
-          });
-
-        } catch (error) {
-
-          results.push({
-            code,
-            error:
-              String(error),
-          });
-        }
-      }
-
-      return new Response(
-        JSON.stringify(
-          results,
-          null,
-          2,
-        ),
-        {
-          headers: {
-            "Content-Type":
-              "application/json; charset=UTF-8",
-          },
-        },
-      );
-    }
+      
     
     /*
      * トップページ
