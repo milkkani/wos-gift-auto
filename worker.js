@@ -3628,8 +3628,9 @@ async function finishCodeJob(
     /*
      * 受取成功
      */
-    if (
-      errCode === "20000"
+        if (
+      errCode === "20000" ||
+      errCode === "40011"
     ) {
 
       success += total;
@@ -3671,9 +3672,8 @@ async function finishCodeJob(
     /*
      * その他の確定エラー
      */
-    if (
-      errCode === "40010" ||
-      errCode === "40011"
+        if (
+      errCode === "40010"
     ) {
 
       invalid += total;
