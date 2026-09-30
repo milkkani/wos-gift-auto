@@ -3868,24 +3868,29 @@ async function redeem(
   /*
    * WOS APIへ送るパラメータ
    */
+
   const params = {
 
-    fid:
-      String(
-        playerId,
-      ),
+  fid:
+    String(
+      playerId,
+    ),
 
-    cdkey:
-      String(
-        code,
-      ),
+  cdk:
+    String(
+      code,
+    ),
 
-    time:
-      String(
-        time,
-      ),
-  };
+  kid:
+    String(
+      kingdomId,
+    ),
 
+  time:
+    String(
+      time,
+    ),
+};
 
   /*
    * =====================================================
