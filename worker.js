@@ -121,7 +121,37 @@ export default {
       );
     }
 
+    /*
+     * WOS API 通信テスト
+     * 一時的なデバッグ用
+     */
+    if (
+      request.method === "GET" &&
+      url.pathname === "/test-wos"
+    ) {
 
+      const result =
+        await redeem(
+          "TEST_CONNECTION_ONLY",
+          "743050483",
+          "3265",
+        );
+
+      return new Response(
+        JSON.stringify(
+          result,
+          null,
+          2,
+        ),
+        {
+          headers: {
+            "Content-Type":
+              "application/json; charset=UTF-8",
+          },
+        },
+      );
+    }
+    
     /*
      * トップページ
      */
