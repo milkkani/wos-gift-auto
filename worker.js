@@ -3963,13 +3963,19 @@ async function redeem(
             "POST",
 
 
-          headers: {
+                    headers: {
 
             "Content-Type":
               "application/x-www-form-urlencoded",
 
+            "Origin":
+              "https://wos-giftcode.centurygame.com",
+
+            "Referer":
+              "https://wos-giftcode.centurygame.com/",
+
             "User-Agent":
-              "WOSGiftAuto (Cloudflare Workers, 4.1)",
+              "Mozilla/5.0",
           },
 
 
