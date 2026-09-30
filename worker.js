@@ -3968,22 +3968,48 @@ async function redeem(
             "POST",
 
 
-                    headers: {
+headers: {
 
-            "Content-Type":
-              "application/x-www-form-urlencoded",
+  "Accept":
+    "application/json, text/plain, */*",
 
-            "Origin":
-              "https://wos-giftcode.centurygame.com",
+  "Accept-Encoding":
+    "gzip, deflate",
 
-            "Referer":
-              "https://wos-giftcode.centurygame.com/",
+  "Accept-Language":
+    "en-US,en;q=0.9",
 
-            "User-Agent":
-              "Mozilla/5.0",
-          },
+  "Content-Type":
+    "application/x-www-form-urlencoded",
 
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
 
+  "Origin":
+    "https://wos-giftcode.centurygame.com",
+
+  "Referer":
+    "https://wos-giftcode.centurygame.com/",
+
+  "Sec-CH-UA":
+    "\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"135\", \"Chromium\";v=\"135\"",
+
+  "Sec-CH-UA-Mobile":
+    "?0",
+
+  "Sec-CH-UA-Platform":
+    "\"Windows\"",
+
+  "Sec-Fetch-Dest":
+    "empty",
+
+  "Sec-Fetch-Mode":
+    "cors",
+
+  "Sec-Fetch-Site":
+    "same-site",
+},
+          
           body:
             body.toString(),
 
