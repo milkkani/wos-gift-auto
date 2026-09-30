@@ -121,8 +121,8 @@ export default {
       );
     }
 
-    /*
-     * WOS API 通信テスト
+       /*
+     * WOS API 実コードテスト
      * 一時的なデバッグ用
      */
     if (
@@ -130,16 +130,44 @@ export default {
       url.pathname === "/test-wos"
     ) {
 
-      const result =
-        await redeem(
-          "TEST_CONNECTION_ONLY",
-          "743050483",
-          "3265",
-        );
+      const testCodes = [
+        "GuDokYTKOR",
+        "2ndYoutubeKR",
+        "1stYoutubeKR",
+        "gogoWOS",
+      ];
+
+      const results = [];
+
+      for (const code of testCodes) {
+
+        try {
+
+          const result =
+            await redeem(
+              code,
+              "743050483",
+              "3265",
+            );
+
+          results.push({
+            code,
+            ...result,
+          });
+
+        } catch (error) {
+
+          results.push({
+            code,
+            error:
+              String(error),
+          });
+        }
+      }
 
       return new Response(
         JSON.stringify(
-          result,
+          results,
           null,
           2,
         ),
