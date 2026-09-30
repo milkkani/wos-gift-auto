@@ -4010,17 +4010,25 @@ async function redeem(
   /*
    * HTTP自体が失敗
    */
-  if (!response.ok) {
-
-    throw new Error(
-      `WOS API HTTP ${response.status}`,
-    );
-  }
-
-
   const text =
-    await response.text();
+  await response.text();
 
+if (!response.ok) {
+  console.error(
+    "WOS API HTTP ERROR:",
+    {
+      status: response.status,
+      body: text,
+      playerId: String(playerId),
+      kingdomId: String(kingdomId),
+      code: String(code),
+    },
+  );
+
+  throw new Error(
+    `WOS API HTTP ${response.status}: ${text.slice(0, 500)}`,
+  );
+}
 
   let data;
 
