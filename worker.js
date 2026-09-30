@@ -3606,7 +3606,7 @@ async function finishCodeJob(
   let other = 0;
 
 
-  /*
+    /*
    * API結果を分類
    */
   for (
@@ -3627,8 +3627,11 @@ async function finishCodeJob(
 
     /*
      * 受取成功
+     *
+     * 20000 = SUCCESS
+     * 40011 = SAME TYPE EXCHANGE
      */
-        if (
+    if (
       errCode === "20000" ||
       errCode === "40011"
     ) {
@@ -3641,11 +3644,11 @@ async function finishCodeJob(
 
     /*
      * 既に受取済み
+     *
+     * 40008 = RECEIVED
      */
     if (
-      errCode === "40008" ||
-      errCode === "40014" ||
-      errCode === "40020"
+      errCode === "40008"
     ) {
 
       already += total;
@@ -3655,12 +3658,16 @@ async function finishCodeJob(
 
 
     /*
-     * 無効・期限切れ
+     * コード自体が使用不可
+     *
+     * 40005 = USED
+     * 40007 = TIME ERROR
+     * 40014 = CDK NOT FOUND
      */
     if (
       errCode === "40005" ||
-      errCode === "40006" ||
-      errCode === "40007"
+      errCode === "40007" ||
+      errCode === "40014"
     ) {
 
       expired += total;
@@ -3670,10 +3677,16 @@ async function finishCodeJob(
 
 
     /*
-     * その他の確定エラー
+     * 登録情報・条件などの確定エラー
+     *
+     * 40006 = STOVE_LV ERROR
+     * 40010 = その他の確定エラー
+     * 40020 = USER INFO ERROR
      */
-        if (
-      errCode === "40010"
+    if (
+      errCode === "40006" ||
+      errCode === "40010" ||
+      errCode === "40020"
     ) {
 
       invalid += total;
