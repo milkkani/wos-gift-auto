@@ -121,8 +121,56 @@ export default {
       );
     }
 
-      
-    
+
+    /*
+     * =====================================================
+     * 【今回追加】
+     * 受け取り済みコード確認ページ
+     * =====================================================
+     *
+     * ここは画面を表示するだけ。
+     * WOS APIへの通信は一切行わない。
+     */
+    if (
+      request.method === "GET" &&
+      url.pathname === "/history"
+    ) {
+
+      return new Response(
+        HISTORY_PAGE,
+        {
+          headers: {
+            "Content-Type":
+              "text/html; charset=UTF-8",
+          },
+        },
+      );
+    }
+
+
+    /*
+     * =====================================================
+     * 【今回追加】
+     * D1から受け取り済みコードを検索
+     * =====================================================
+     *
+     * 王国番号 + プレイヤーIDで登録者を確認し、
+     * 既にD1に保存されている履歴を読むだけ。
+     *
+     * WOS APIへの通信は一切行わない。
+     */
+    if (
+      request.method === "POST" &&
+      url.pathname === "/lookup-history"
+    ) {
+
+      return lookupReceivedCodes(
+        request,
+        env,
+      );
+    }
+
+
     /*
      * トップページ
      */
@@ -960,6 +1008,157 @@ async function lookupMember(
 
 
 /* =========================================================
+   【今回追加】
+   受け取り済みギフトコードを検索
+========================================================= */
+
+async function lookupReceivedCodes(
+  request,
+  env,
+) {
+
+  const form =
+    await request.formData();
+
+
+  const playerId =
+    String(
+      form.get(
+        "player_id",
+      ) || "",
+    ).trim();
+
+
+  const kingdomId =
+    String(
+      form.get(
+        "kingdom_id",
+      ) || "",
+    ).trim();
+
+
+  /*
+   * 数字以外は検索しない
+   */
+  if (
+    !/^\d{6,15}$/.test(playerId) ||
+    !/^\d{1,6}$/.test(kingdomId)
+  ) {
+
+    return pageMessage(
+      "確認できません",
+      "プレイヤーIDと王国番号を正しく入力してください。",
+      false,
+    );
+  }
+
+
+  /*
+   * 登録者を検索
+   *
+   * ここではWOS APIへ通信しない。
+   * 既存のmembersテーブルを見るだけ。
+   */
+  const member =
+    await env.MEMBERS_DB
+      .prepare(`
+        SELECT
+          id,
+          player_name,
+          player_id,
+          kingdom_id
+
+        FROM members
+
+        WHERE
+          player_id = ?
+          AND kingdom_id = ?
+          AND active = 1
+
+        LIMIT 1
+      `)
+
+      .bind(
+        playerId,
+        kingdomId,
+      )
+
+      .first();
+
+
+  if (!member) {
+
+    return pageMessage(
+      "登録が見つかりません",
+      "入力したプレイヤーID・王国番号の登録は見つかりませんでした。",
+      false,
+    );
+  }
+
+
+  /*
+   * =====================================================
+   * 受け取り済みだけ取得
+   * =====================================================
+   *
+   * 20000 = 正常に受け取り成功
+   * 40008 = すでに受け取り済み
+   *
+   * 40011・40020などは表示しない。
+   *
+   * ここもD1を読むだけ。
+   */
+  const result =
+    await env.MEMBERS_DB
+      .prepare(`
+        SELECT
+          code,
+          processed_at
+
+        FROM processed_codes
+
+        WHERE
+          member_id = ?
+          AND err_code IN (
+            '20000',
+            '40008'
+          )
+
+        ORDER BY
+          processed_at DESC,
+          code ASC
+      `)
+
+      .bind(
+        member.id,
+      )
+
+      .all();
+
+
+  const receivedCodes =
+    result?.results || [];
+
+
+  return new Response(
+
+    receivedCodesPage(
+      member,
+      receivedCodes,
+    ),
+
+    {
+      headers: {
+        "Content-Type":
+          "text/html; charset=UTF-8",
+      },
+    },
+  );
+}
+
+
+
+/* =========================================================
    変更申請を作成
 ========================================================= */
 
@@ -1119,7 +1318,7 @@ async function createChangeRequest(
       member.player_name,
     ) === newPlayerName &&
 
-    String(
+        String(
       member.player_id,
     ) === newPlayerId &&
 
@@ -1386,6 +1585,8 @@ ID：${newPlayerId}
   );
 }
 
+
+
 /* =========================================================
    Discordで変更申請の承認・却下を確認
 ========================================================= */
@@ -1548,8 +1749,7 @@ async function checkChangeRequestCommands(
 
             SET
               status = 'rejected',
-              resolved_at =
-                CURRENT_TIMESTAMP
+              resolved_at = CURRENT_TIMESTAMP
 
             WHERE
               id = ?
@@ -1563,21 +1763,12 @@ async function checkChangeRequestCommands(
           .run();
 
 
-      const changed =
-        Number(
-          result?.meta?.changes ??
-          result?.changes ??
-          0,
-        );
-
-
-      /*
-       * 他のCronが先に処理した場合は
-       * 二重通知しない
-       */
       if (
-        changed === 0
+        Number(
+          result?.meta?.changes || 0,
+        ) < 1
       ) {
+
         continue;
       }
 
@@ -1588,9 +1779,7 @@ async function checkChangeRequestCommands(
 
         CHANGE_REQUEST_CHANNEL,
 
-        `❌ **変更申請 #${requestId} を却下しました。**
-
-登録情報は変更されていません。`,
+        `❌ 変更申請 #${requestId} を却下しました。`,
       );
 
 
@@ -1604,9 +1793,8 @@ async function checkChangeRequestCommands(
      * =====================================================
      */
 
-
     /*
-     * 現在のmembers情報を取得
+     * 現在の登録を取得
      */
     const currentMember =
       await env.MEMBERS_DB
@@ -1633,56 +1821,36 @@ async function checkChangeRequestCommands(
         .first();
 
 
-    /*
-     * 元の登録が消えていた場合
-     */
     if (!currentMember) {
 
-      const result =
-        await env.MEMBERS_DB
-          .prepare(`
-            UPDATE change_requests
+      await env.MEMBERS_DB
+        .prepare(`
+          UPDATE change_requests
 
-            SET
-              status = 'error',
-              resolved_at =
-                CURRENT_TIMESTAMP
+          SET
+            status = 'rejected',
+            resolved_at = CURRENT_TIMESTAMP
 
-            WHERE
-              id = ?
-              AND status = 'pending'
-          `)
+          WHERE
+            id = ?
+            AND status = 'pending'
+        `)
 
-          .bind(
-            requestId,
-          )
+        .bind(
+          requestId,
+        )
 
-          .run();
+        .run();
 
 
-      const changed =
-        Number(
-          result?.meta?.changes ??
-          result?.changes ??
-          0,
-        );
+      await sendDiscordToChannel(
 
+        env,
 
-      if (
-        changed > 0
-      ) {
+        CHANGE_REQUEST_CHANNEL,
 
-        await sendDiscordToChannel(
-
-          env,
-
-          CHANGE_REQUEST_CHANNEL,
-
-          `⚠️ **変更申請 #${requestId}**
-
-元の登録情報が見つからなかったため、承認できませんでした。`,
-        );
-      }
+        `⚠️ 変更申請 #${requestId} は、元の登録が見つからないため承認できませんでした。`,
+      );
 
 
       continue;
@@ -1690,85 +1858,60 @@ async function checkChangeRequestCommands(
 
 
     /*
-     * 申請後に現在の登録情報が
-     * 別の方法で変更されていないか確認。
-     *
-     * 申請時点と違っていたら
-     * 古い申請で上書きしない。
+     * 申請を出した後に
+     * 登録内容が別の方法で変更されていないか確認
      */
-    if (
+    const staleRequest =
+
       String(
         currentMember.player_name,
-      ) !==
-        String(
-          changeRequest.old_player_name,
-        ) ||
+      ) !== String(
+        changeRequest.old_player_name,
+      ) ||
 
       String(
         currentMember.player_id,
-      ) !==
-        String(
-          changeRequest.old_player_id,
-        ) ||
+      ) !== String(
+        changeRequest.old_player_id,
+      ) ||
 
       String(
         currentMember.kingdom_id,
-      ) !==
-        String(
-          changeRequest.old_kingdom_id,
+      ) !== String(
+        changeRequest.old_kingdom_id,
+      );
+
+
+    if (staleRequest) {
+
+      await env.MEMBERS_DB
+        .prepare(`
+          UPDATE change_requests
+
+          SET
+            status = 'rejected',
+            resolved_at = CURRENT_TIMESTAMP
+
+          WHERE
+            id = ?
+            AND status = 'pending'
+        `)
+
+        .bind(
+          requestId,
         )
-    ) {
 
-      const result =
-        await env.MEMBERS_DB
-          .prepare(`
-            UPDATE change_requests
-
-            SET
-              status = 'error',
-              resolved_at =
-                CURRENT_TIMESTAMP
-
-            WHERE
-              id = ?
-              AND status = 'pending'
-          `)
-
-          .bind(
-            requestId,
-          )
-
-          .run();
+        .run();
 
 
-      const changed =
-        Number(
-          result?.meta?.changes ??
-          result?.changes ??
-          0,
-        );
+      await sendDiscordToChannel(
 
+        env,
 
-      if (
-        changed > 0
-      ) {
+        CHANGE_REQUEST_CHANNEL,
 
-        await sendDiscordToChannel(
-
-          env,
-
-          CHANGE_REQUEST_CHANNEL,
-
-          `⚠️ **変更申請 #${requestId}**
-
-申請後に登録情報が変わっていたため、自動承認を中止しました。
-
-現在：
-${currentMember.player_name}
-王国${currentMember.kingdom_id}
-ID ${currentMember.player_id}`,
-        );
-      }
+        `⚠️ 変更申請 #${requestId} は、申請後に登録情報が変わっているため承認できませんでした。`,
+      );
 
 
       continue;
@@ -1776,9 +1919,9 @@ ID ${currentMember.player_id}`,
 
 
     /*
-     * 変更後のID + 王国番号が
-     * 別の登録と重複していないか
-     * 承認直前にも再確認
+     * 変更後ID + 王国番号が
+     * 他のactive登録と重複していないか
+     * 承認時にも再確認
      */
     const duplicate =
       await env.MEMBERS_DB
@@ -1807,58 +1950,40 @@ ID ${currentMember.player_id}`,
 
     if (duplicate) {
 
-      const result =
-        await env.MEMBERS_DB
-          .prepare(`
-            UPDATE change_requests
+      await env.MEMBERS_DB
+        .prepare(`
+          UPDATE change_requests
 
-            SET
-              status = 'error',
-              resolved_at =
-                CURRENT_TIMESTAMP
+          SET
+            status = 'rejected',
+            resolved_at = CURRENT_TIMESTAMP
 
-            WHERE
-              id = ?
-              AND status = 'pending'
-          `)
+          WHERE
+            id = ?
+            AND status = 'pending'
+        `)
 
-          .bind(
-            requestId,
-          )
+        .bind(
+          requestId,
+        )
 
-          .run();
+        .run();
 
 
-      const changed =
-        Number(
-          result?.meta?.changes ??
-          result?.changes ??
-          0,
-        );
+      await sendDiscordToChannel(
 
+        env,
 
-      if (
-        changed > 0
-      ) {
+        CHANGE_REQUEST_CHANNEL,
 
-        await sendDiscordToChannel(
-
-          env,
-
-          CHANGE_REQUEST_CHANNEL,
-
-          `⚠️ **変更申請 #${requestId}**
-
-変更後のプレイヤーID・王国番号が、別の登録と重複しているため承認できませんでした。`,
-        );
-      }
+        `⚠️ 変更申請 #${requestId} は、変更後のID・王国番号が別の登録と重複しているため承認できませんでした。`,
+      );
 
 
       continue;
     }
 
-
-    /*
+      /*
      * プレイヤーIDが変わったか
      */
     const playerIdChanged =
@@ -2160,7 +2285,8 @@ async function sendDiscordToChannel(
       `https://discord.com/api/v10/channels/${channelId}/messages`,
 
       {
-        method: "POST",
+        method:
+          "POST",
 
         headers: {
 
@@ -2169,8 +2295,10 @@ async function sendDiscordToChannel(
 
           "Content-Type":
             "application/json",
-        },
 
+          "User-Agent":
+            "WOSGiftAuto (Cloudflare Workers, 4.1)",
+        },
 
         body:
           JSON.stringify({
@@ -3056,6 +3184,8 @@ async function processDetectedCodes(
   }
 }
 
+
+
 /* =========================================================
    コードを登録者へ配布
 ========================================================= */
@@ -3348,7 +3478,8 @@ async function processCodeForMembers(
         /*
          * =================================================
          * 未知・一時的な結果
-         * =================================================
+
+                 * =================================================
          *
          * DBへ確定結果として保存しない。
          *
@@ -3606,7 +3737,7 @@ async function finishCodeJob(
   let other = 0;
 
 
-    /*
+  /*
    * API結果を分類
    */
   for (
@@ -3860,6 +3991,8 @@ async function finishCodeJob(
   );
 }
 
+
+
 /* =========================================================
    WOSギフトコード受取API
 ========================================================= */
@@ -3885,26 +4018,27 @@ async function redeem(
 
   const params = {
 
-  fid:
-    String(
-      playerId,
-    ),
+    fid:
+      String(
+        playerId,
+      ),
 
-  cdk:
-    String(
-      code,
-    ),
+    cdk:
+      String(
+        code,
+      ),
 
-  kid:
-    String(
-      kingdomId,
-    ),
+    kid:
+      String(
+        kingdomId,
+      ),
 
-  time:
-    String(
-      time,
-    ),
-};
+    time:
+      String(
+        time,
+      ),
+  };
+
 
   /*
    * =====================================================
@@ -3948,7 +4082,6 @@ async function redeem(
 
       sign,
     });
-
 
   /*
    * タイムアウト制御
@@ -4549,7 +4682,7 @@ body {
       0.96
     );
 
-  border-radius:
+      border-radius:
     22px;
 
   padding:
@@ -4881,6 +5014,8 @@ hr {
 
 `;
 
+
+
 /* =========================================================
    登録情報確認ページ
 ========================================================= */
@@ -4991,6 +5126,285 @@ ${PAGE_STYLE}
 </body>
 
 </html>`;
+
+
+
+/* =========================================================
+   【今回追加】
+   受け取り済みコード確認ページ
+========================================================= */
+
+const HISTORY_PAGE = `<!DOCTYPE html>
+
+<html lang="ja">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>
+受け取り済みコードを確認
+</title>
+
+
+<style>
+${PAGE_STYLE}
+</style>
+
+</head>
+
+
+<body>
+
+<div class="container">
+
+  <div class="card">
+
+    <h1>
+      🎁 受け取り済みコードを確認
+    </h1>
+
+
+    <p class="description">
+      登録した王国番号とプレイヤーIDを入力してください。
+      これまでに受け取り済みのギフトコードを確認できます。
+    </p>
+
+
+    <form
+      method="POST"
+      action="/lookup-history"
+    >
+
+
+      <label>
+        王国番号
+      </label>
+
+
+      <input
+        type="number"
+        name="kingdom_id"
+        min="1"
+        max="999999"
+        inputmode="numeric"
+        placeholder="例：3338"
+        required
+      >
+
+
+      <label>
+        プレイヤーID
+      </label>
+
+
+      <input
+        type="text"
+        name="player_id"
+        inputmode="numeric"
+        pattern="[0-9]{6,15}"
+        placeholder="例：123456789"
+        required
+      >
+
+
+      <button
+        type="submit"
+      >
+        受け取り済みコードを確認
+      </button>
+
+    </form>
+
+
+    <div class="button-area">
+
+      <a
+        class="button secondary"
+        href="/"
+      >
+        新規登録ページへ戻る
+      </a>
+
+    </div>
+
+  </div>
+
+</div>
+
+</body>
+
+</html>`;
+
+
+
+/* =========================================================
+   【今回追加】
+   受け取り済みコード結果ページ
+========================================================= */
+
+function receivedCodesPage(
+  member,
+  receivedCodes,
+) {
+
+  const playerName =
+    escapeHtml(
+      member.player_name,
+    );
+
+
+  const kingdomId =
+    escapeHtml(
+      member.kingdom_id,
+    );
+
+
+  let codesHtml = "";
+
+
+  if (
+    receivedCodes.length === 0
+  ) {
+
+    codesHtml = `
+      <div class="info-box">
+        受け取り済みとして記録されている
+        ギフトコードはまだありません。
+      </div>
+    `;
+
+
+  } else {
+
+    codesHtml =
+      receivedCodes
+
+        .map(
+          (row) => {
+
+            const code =
+              escapeHtml(
+                row.code,
+              );
+
+
+            const processedAt =
+              escapeHtml(
+                row.processed_at,
+              );
+
+
+            return `
+              <div class="info-box">
+                <strong>
+                  ${code}
+                </strong>
+
+                <br>
+
+                <small>
+                  記録日時：${processedAt}
+                </small>
+              </div>
+            `;
+          },
+        )
+
+        .join("");
+  }
+
+
+  return `<!DOCTYPE html>
+
+<html lang="ja">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1.0"
+>
+
+<title>
+受け取り済みギフトコード
+</title>
+
+
+<style>
+${PAGE_STYLE}
+</style>
+
+</head>
+
+
+<body>
+
+<div class="container">
+
+  <div class="card">
+
+    <div class="result-icon">
+      🎁
+    </div>
+
+
+    <h1>
+      受け取り済みギフトコード
+    </h1>
+
+
+    <p class="description">
+      ${playerName}さん / 王国${kingdomId}
+    </p>
+
+
+    <div class="info-box">
+
+      <strong>
+        受け取り済み：${receivedCodes.length}個
+      </strong>
+
+    </div>
+
+
+    ${codesHtml}
+
+
+    <div class="button-area">
+
+      <a
+        class="button"
+        href="/history"
+      >
+        別の登録を確認
+      </a>
+
+
+      <a
+        class="button secondary"
+        href="/"
+      >
+        登録ページへ戻る
+      </a>
+
+    </div>
+
+  </div>
+
+</div>
+
+</body>
+
+</html>`;
+}
 
 
 
@@ -5133,6 +5547,18 @@ ${PAGE_STYLE}
         登録情報を確認・変更
       </a>
 
+
+      <!--
+        【今回追加】
+        見た目は既存ボタンと同じ。
+      -->
+      <a
+        class="button secondary"
+        href="/history"
+      >
+        🎁 受け取り済みコードを確認
+      </a>
+
     </div>
 
   </div>
@@ -5143,12 +5569,15 @@ ${PAGE_STYLE}
 
 </html>`;
 
+
+
 /* =========================================================
    MD5
 ========================================================= */
 
 function md5(
-  string,
+
+    string,
 ) {
 
   function rotateLeft(
@@ -5903,4 +6332,3 @@ function md5(
 
   ).toLowerCase();
 }
-
