@@ -698,7 +698,7 @@ async function registerMember(
   if (
     Number(
       count?.total || 0,
-    ) >= 500
+    ) >= 50000
   ) {
 
     return pageMessage(
