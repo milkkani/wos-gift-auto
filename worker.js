@@ -1162,320 +1162,217 @@ async function lookupReceivedCodes(
    変更申請を作成
 ========================================================= */
 
-async function createChangeRequest(
-  request,
-  env,
-) {
 
-  const form =
-    await request.formData();
+/*
+ * 登録情報の変更：自動承認
+ * ギフトコード受取処理には触れない
+ */
+async function createChangeRequest(request, env) {
+  const form = await request.formData();
 
+  const memberId = Number(form.get("member_id"));
+  const oldPlayerId = String(form.get("old_player_id") || "").trim();
+  const oldKingdomId = String(form.get("old_kingdom_id") || "").trim();
 
-  const memberId =
-    Number(
-      form.get(
-        "member_id",
-      ),
-    );
+  const newPlayerName = String(form.get("player_name") || "").trim();
+  const newPlayerId = String(form.get("player_id") || "").trim();
+  const newKingdomId = String(form.get("kingdom_id") || "").trim();
 
-
-  /*
-   * 検索した時点の情報。
-   *
-   * 途中で登録情報が変わっていないか
-   * 確認するために使う。
-   */
-  const oldPlayerId =
-    String(
-      form.get(
-        "old_player_id",
-      ) || "",
-    ).trim();
-
-
-  const oldKingdomId =
-    String(
-      form.get(
-        "old_kingdom_id",
-      ) || "",
-    ).trim();
-
-
-  /*
-   * ユーザーが変更後として入力した情報
-   */
-  const newPlayerName =
-    String(
-      form.get(
-        "player_name",
-      ) || "",
-    ).trim();
-
-
-  const newPlayerId =
-    String(
-      form.get(
-        "player_id",
-      ) || "",
-    ).trim();
-
-
-  const newKingdomId =
-    String(
-      form.get(
-        "kingdom_id",
-      ) || "",
-    ).trim();
-
-
-  const validationError =
-    validateMemberFields(
-      newPlayerName,
-      newPlayerId,
-      newKingdomId,
-    );
-
-
-  if (
-    !Number.isInteger(memberId) ||
-    memberId < 1
-  ) {
-
+  if (!Number.isSafeInteger(memberId) || memberId < 1) {
     return pageMessage(
-
-      "申請できません",
-
+      "変更できません",
       "登録情報が正しくありません。最初からやり直してください。",
-
-      false,
+      false
     );
   }
 
+  const validationError = validateMemberFields(
+    newPlayerName,
+    newPlayerId,
+    newKingdomId
+  );
 
   if (validationError) {
+    return pageMessage("変更できません", validationError, false);
+  }
 
+  const db = env.MEMBERS_DB;
+
+  const member = await db.prepare(`
+    SELECT id, player_name, player_id, kingdom_id
+    FROM members
+    WHERE id = ?
+      AND player_id = ?
+      AND kingdom_id = ?
+      AND active = 1
+    LIMIT 1
+  `).bind(memberId, oldPlayerId, oldKingdomId).first();
+
+  if (!member) {
     return pageMessage(
-
-      "申請できません",
-
-      validationError,
-
-      false,
+      "変更できません",
+      "登録情報が見つからないか、すでに変更されています。最初からやり直してください。",
+      false
     );
   }
 
+  const same =
+    String(member.player_name) === newPlayerName &&
+    String(member.player_id) === newPlayerId &&
+    String(member.kingdom_id) === newKingdomId;
 
-  /*
-   * 現在の登録情報を取得
-   */
-  const member =
-    await env.MEMBERS_DB
-      .prepare(`
-        SELECT
-          id,
-          player_name,
-          player_id,
-          kingdom_id
+  if (same) {
+    return pageMessage(
+      "変更内容がありません",
+      "現在の登録情報と同じです。",
+      false
+    );
+  }
 
-        FROM members
+  // 別の登録者との重複を防止
+  const duplicate = await db.prepare(`
+    SELECT id FROM members
+    WHERE player_id = ?
+      AND kingdom_id = ?
+      AND id <> ?
+      AND active = 1
+    LIMIT 1
+  `).bind(newPlayerId, newKingdomId, memberId).first();
 
-        WHERE
-          id = ?
+  if (duplicate) {
+    return pageMessage(
+      "変更できません",
+      "変更後のプレイヤーID・王国番号は、すでに登録されています。",
+      false
+    );
+  }
+
+  // 既存の未処理申請がある場合は安全のため停止
+  const pending = await db.prepare(`
+    SELECT id FROM change_requests
+    WHERE member_id = ? AND status = 'pending'
+    LIMIT 1
+  `).bind(memberId).first();
+
+  if (pending) {
+    return pageMessage(
+      "変更できません",
+      "以前の変更申請が処理待ちです。管理者へお問い合わせください。",
+      false
+    );
+  }
+
+  // 10分間の連続変更を制限
+  const recent = await db.prepare(`
+    SELECT id FROM change_requests
+    WHERE member_id = ?
+      AND status = 'approved'
+      AND created_at > datetime('now', '-10 minutes')
+    LIMIT 1
+  `).bind(memberId).first();
+
+  if (recent) {
+    return pageMessage(
+      "変更できません",
+      "前回の変更から10分以上経過してからお試しください。",
+      false
+    );
+  }
+
+  const playerIdChanged =
+    String(member.player_id) !== newPlayerId;
+
+  const kingdomChanged =
+    String(member.kingdom_id) !== newKingdomId;
+
+  // D1の変更と履歴保存をまとめて実行
+  try {
+    const statements = [
+      db.prepare(`
+        UPDATE members
+        SET player_name = ?,
+            player_id = ?,
+            kingdom_id = ?
+        WHERE id = ?
           AND player_id = ?
           AND kingdom_id = ?
           AND active = 1
-
-        LIMIT 1
-      `)
-
-      .bind(
-        memberId,
-        oldPlayerId,
-        oldKingdomId,
-      )
-
-      .first();
-
-
-  if (!member) {
-
-    return pageMessage(
-
-      "申請できません",
-
-      "登録情報が途中で変更されたか、登録が見つかりませんでした。最初からやり直してください。",
-
-      false,
-    );
-  }
-
-
-  /*
-   * 何も変更されていない
-   */
-  if (
-    String(
-      member.player_name,
-    ) === newPlayerName &&
-
-        String(
-      member.player_id,
-    ) === newPlayerId &&
-
-    String(
-      member.kingdom_id,
-    ) === newKingdomId
-  ) {
-
-    return pageMessage(
-
-      "変更内容がありません",
-
-      "現在の登録情報と同じです。変更したい項目を書き換えてください。",
-
-      false,
-    );
-  }
-
-
-  /*
-   * 変更後のID + 王国番号が
-   * 他の登録者と重複していないか確認
-   */
-  const duplicate =
-    await env.MEMBERS_DB
-      .prepare(`
-        SELECT id
-
-        FROM members
-
-        WHERE
-          player_id = ?
-          AND kingdom_id = ?
-          AND id <> ?
-          AND active = 1
-
-        LIMIT 1
-      `)
-
-      .bind(
-        newPlayerId,
-        newKingdomId,
-        member.id,
-      )
-
-      .first();
-
-
-  if (duplicate) {
-
-    return pageMessage(
-
-      "申請できません",
-
-      "変更後のプレイヤーID・王国番号は、すでに別の登録で使用されています。",
-
-      false,
-    );
-  }
-
-
-  /*
-   * 既に承認待ちの申請があるか確認
-   */
-  const existingPending =
-    await env.MEMBERS_DB
-      .prepare(`
-        SELECT id
-
-        FROM change_requests
-
-        WHERE
-          member_id = ?
-          AND status = 'pending'
-
-        LIMIT 1
-      `)
-
-      .bind(
-        member.id,
-      )
-
-      .first();
-
-
-  if (existingPending) {
-
-    return pageMessage(
-
-      "変更申請中です",
-
-      `すでに変更申請 #${existingPending.id} が承認待ちです。`,
-
-      true,
-    );
-  }
-
-
-  /*
-   * 変更申請を保存
-   */
-  const inserted =
-    await env.MEMBERS_DB
-      .prepare(`
-        INSERT INTO change_requests
-        (
-          member_id,
-
-          old_player_name,
-          old_player_id,
-          old_kingdom_id,
-
-          new_player_name,
-          new_player_id,
-          new_kingdom_id
-        )
-
-        VALUES (
-          ?,
-          ?,
-          ?,
-          ?,
-          ?,
-          ?,
-          ?
-        )
-      `)
-
-      .bind(
-
-        member.id,
-
-        member.player_name,
-        member.player_id,
-        member.kingdom_id,
-
+      `).bind(
         newPlayerName,
         newPlayerId,
         newKingdomId,
+        memberId,
+        oldPlayerId,
+        oldKingdomId
+      ),
+
+      db.prepare(`
+        INSERT INTO change_requests (
+          member_id,
+          old_player_name,
+          old_player_id,
+          old_kingdom_id,
+          new_player_name,
+          new_player_id,
+          new_kingdom_id,
+          status,
+          resolved_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', CURRENT_TIMESTAMP)
+      `).bind(
+        memberId,
+        member.player_name,
+        member.player_id,
+        member.kingdom_id,
+        newPlayerName,
+        newPlayerId,
+        newKingdomId
       )
+    ];
 
-      .run();
+    // ID変更なら旧アカウントの受取履歴をリセット
+    if (playerIdChanged) {
+      statements.push(
+        db.prepare(`
+          DELETE FROM processed_codes
+          WHERE member_id = ?
+        `).bind(memberId)
+      );
+    } else if (kingdomChanged) {
+      // 王国だけ変更ならユーザー情報エラーのみ再試行対象に
+      statements.push(
+        db.prepare(`
+          DELETE FROM processed_codes
+          WHERE member_id = ?
+            AND err_code = '40020'
+        `).bind(memberId)
+      );
+    }
 
+    await db.batch(statements);
 
-  const requestId =
-    Number(
-      inserted?.meta
-        ?.last_row_id || 0,
+  } catch (error) {
+    console.error("auto change error:", error);
+
+    return pageMessage(
+      "変更できませんでした",
+      "登録情報の更新に失敗しました。管理者へお問い合わせください。",
+      false
     );
+  }
 
+  // 保存した変更履歴の申請番号を取得
+  const history = await db.prepare(`
+    SELECT id FROM change_requests
+    WHERE member_id = ?
+      AND status = 'approved'
+    ORDER BY id DESC
+    LIMIT 1
+  `).bind(memberId).first();
 
-  /*
-   * Discordに送る申請内容
-   */
-  const discordText =
+  const requestId = history?.id || "不明";
 
-    `📝 **登録情報の変更申請 #${requestId}**
+  const discordText = `✅ **登録情報の変更申請 #${requestId} — 承認済み**
 
 **変更前**
 名前：${member.player_name}
@@ -1487,103 +1384,26 @@ ID：${member.player_id}
 王国：${newKingdomId}
 ID：${newPlayerId}
 
-承認する場合：
-\`承認 ${requestId}\`
+登録情報の変更が完了しました。`;
 
-却下する場合：
-\`却下 ${requestId}\``;
-
-
+  // Discord通知に失敗しても、完了したDB更新は取り消さない
   try {
-
-    const discordMessage =
-      await sendDiscordToChannel(
-
-        env,
-
-        CHANGE_REQUEST_CHANNEL,
-
-        discordText,
-      );
-
-
-    /*
-     * Discord側のメッセージIDも保存
-     */
-    if (
-      discordMessage?.id
-    ) {
-
-      await env.MEMBERS_DB
-        .prepare(`
-          UPDATE change_requests
-
-          SET
-            discord_message_id = ?
-
-          WHERE id = ?
-        `)
-
-        .bind(
-          String(
-            discordMessage.id,
-          ),
-
-          requestId,
-        )
-
-        .run();
-    }
-
-
+    await sendDiscordToChannel(
+      env,
+      CHANGE_REQUEST_CHANNEL,
+      discordText
+    );
   } catch (error) {
-
-    /*
-     * Discordへ送れなかった場合は
-     * DBだけに申請を残さない。
-     */
-    await env.MEMBERS_DB
-      .prepare(`
-        DELETE FROM change_requests
-
-        WHERE
-          id = ?
-          AND status = 'pending'
-      `)
-
-      .bind(
-        requestId,
-      )
-
-      .run();
-
-
-    console.error(
-      "change request discord error:",
-      error,
-    );
-
-
-    return pageMessage(
-
-      "申請を送れませんでした",
-
-      "Discordへの送信に失敗しました。少し時間を置いてもう一度お試しください。",
-
-      false,
-    );
+    console.error("auto change notification error:", error);
   }
 
-
   return pageMessage(
-
-    "変更申請を送りました",
-
-    `申請番号は #${requestId} です。管理者が承認すると登録情報が更新されます。`,
-
-    true,
+    "登録情報を変更しました",
+    "変更が完了しました。次回から新しい登録情報が使用されます。",
+    true
   );
 }
+
 
 
 
