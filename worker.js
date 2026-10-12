@@ -4533,6 +4533,14 @@ ${PAGE_STYLE}
       >
 
 
+<p class="description">
+  📢 <strong>名前の変更について</strong><br>
+  ゲーム内の名前と登録名が異なっていても、
+  ギフトコードの受け取りには影響しません。<br>
+  <strong>名前だけの変更申請は不要です。</strong>
+</p>
+
+
       <label>
         プレイヤー名
       </label>
