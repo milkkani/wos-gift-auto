@@ -624,13 +624,22 @@ async function ensureDatabase(env) {
    新規登録
 ========================================================= */
 
+
 async function registerMember(
   request,
   env,
 ) {
 
+  // 新規登録を一時停止
+  return pageMessage(
+    "新規登録を一時停止しています",
+    "想定を上回るご登録をいただいたため、安定運用を優先し、新規登録の受付を一時停止しております。既存登録者へのギフトコード配布は通常どおり継続します。再開時期は未定です。",
+    false,
+  );
+
   const form =
     await request.formData();
+
 
 
   const playerName =
